@@ -16,8 +16,11 @@ package raft
 
 import (
 	"errors"
-
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math/rand"
+	"sync"
+	"time"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -36,6 +39,22 @@ var stmap = [...]string{
 	"StateFollower",
 	"StateCandidate",
 	"StateLeader",
+}
+
+type lockedRand struct {
+	mu   sync.Mutex
+	rand *rand.Rand
+}
+
+func (r *lockedRand) Intn(n int) int {
+	r.mu.Lock()
+	v := r.rand.Intn(n)
+	r.mu.Unlock()
+	return v
+}
+
+var globalRand = &lockedRand{
+	rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 }
 
 func (st StateType) String() string {
@@ -116,7 +135,7 @@ type Raft struct {
 	// the log
 	RaftLog *RaftLog
 
-	// log replication progress of each peers
+	// log replication progress of each peers  ->
 	Prs map[uint64]*Progress
 
 	// this peer's role
@@ -157,6 +176,8 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	randomElectionTimeout int
 }
 
 // newRaft return a raft peer with the given config
@@ -165,7 +186,40 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	hardState, _, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+	raftLog := newLog(c.Storage)
+
+	raft := &Raft{
+		id:               c.ID,
+		Lead:             None,
+		Prs:              make(map[uint64]*Progress),
+		RaftLog:          raftLog,
+		electionTimeout:  c.ElectionTick,
+		heartbeatTimeout: c.HeartbeatTick,
+	}
+
+	if !IsEmptyHardState(hardState) {
+		if hardState.Commit < raft.RaftLog.committed || hardState.Commit > raft.RaftLog.LastIndex() {
+			log.Panicf("%x state.commit %d is out of range [%d, %d]", raft.id, hardState.Commit, raft.RaftLog.committed, raft.RaftLog.LastIndex())
+		}
+		raft.Term = hardState.Term
+		raft.Vote = hardState.Vote
+		raft.RaftLog.committed = hardState.Commit
+	}
+
+	for _, peer := range c.peers { //这里有点问题，restart时peer是空的，应该从config中拿
+		raft.Prs[peer] = &Progress{Next: 1, Match: 0}
+	}
+
+	if c.Applied > 0 {
+		raft.RaftLog.appliedTo(c.Applied)
+	}
+	raft.becomeFollower(raft.Term, None)
+
+	return raft
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -183,21 +237,39 @@ func (r *Raft) sendHeartbeat(to uint64) {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	switch r.State {
+	case StateFollower, StateCandidate:
+		r.tickElection()
+
+	case StateLeader:
+		r.tickHeartBeat()
+
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.reset(term)
+	r.Lead = lead
+	r.State = StateFollower
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.reset(r.Term + 1)
+	//投给自己
+	r.Vote = r.id
+	r.State = StateCandidate
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
+	r.reset(r.Term)
+	r.Lead = r.id
+	r.State = StateLeader
 	// NOTE: Leader should propose a noop entry on its term
 }
 
@@ -205,10 +277,61 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	switch r.State {
-	case StateFollower:
-	case StateCandidate:
-	case StateLeader:
+
+	//检查term
+	switch {
+	case m.Term == 0:
+		//本地消息
+	case m.Term > r.Term:
+		//收到具有更大Term的消息
+		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend {
+			//已经有新Leader了
+			r.becomeFollower(m.Term, m.From)
+		} else {
+			//有新的Candidate
+			r.becomeFollower(m.Term, None)
+		}
+	case m.Term < r.Term:
+		//收到更小Term的消息
+		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat {
+			r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse})
+		}
+		return nil
+	}
+
+	//处理HUP、Vote信息，即follwer、candidate、leader都可以进行该判断
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		//收到tickElection超时后触发的Hup消息，开始一轮选举
+		if r.State != StateLeader {
+			//log.Infof("%x is starting a new election at term %d", r.id, r.Term)
+			r.startElection()
+		} else {
+			log.Debugf("%x ignoring MsgHup because already leader", r.id)
+		}
+
+	case pb.MessageType_MsgRequestVote:
+		//在m.Term > r.Term中已经处理了，不会再出现该情况
+		canVote := (r.Vote == None || r.Vote == m.From) &&
+			(r.RaftLog.LastTerm() < m.LogTerm || (r.RaftLog.LastTerm() == m.LogTerm && r.RaftLog.LastIndex() <= m.Index))
+		if canVote {
+			r.send(pb.Message{To: m.From, Term: m.Term, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: false})
+			r.electionElapsed = 0
+			r.Vote = m.From
+		} else {
+			r.send(pb.Message{To: m.From, Term: m.Term, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true})
+		}
+
+	default:
+		//其他消息，根据状态进行处理
+		switch r.State {
+		case StateFollower:
+			r.stepFollower(m)
+		case StateCandidate:
+			r.stepCandidate(m)
+		case StateLeader:
+			r.stepLeader(m)
+		}
 	}
 	return nil
 }
@@ -236,4 +359,131 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func (r *Raft) resetRandomElectionTimeout() {
+	r.randomElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+}
+
+func (r *Raft) reset(term uint64) {
+	//重新设置term、重新设置超时时间、重置Lead、Vote等
+	if r.Term != term {
+		//新的term，说明遇到了具有更大term的msg,重新设置voteFor,会在step中确认投票时改成对应的Vote
+		r.Term = term
+		r.Vote = None
+	}
+	r.Lead = None
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomElectionTimeout()
+
+	//重置votes、progress等信息
+	r.votes = make(map[uint64]bool)
+	for peerId := range r.Prs {
+		//只有Leader节点用得到这个数据
+		r.Prs[peerId] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+	}
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+
+}
+
+func (r *Raft) tickElection() {
+	r.electionElapsed++
+	if r.electionElapsed >= r.randomElectionTimeout {
+		r.electionElapsed = 0
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
+	}
+}
+
+func (r *Raft) tickHeartBeat() {
+	r.heartbeatElapsed++
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgBeat})
+	}
+}
+
+func (r *Raft) send(message pb.Message) {
+	message.From = r.id
+	r.msgs = append(r.msgs, message)
+}
+
+func (r *Raft) stepFollower(m pb.Message) {
+
+}
+
+func (r *Raft) stepCandidate(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgRequestVoteResponse:
+		_, _, res := r.pollAndCountVotes(m.From, !m.Reject)
+		if res {
+			r.becomeLeader()
+		}
+	case pb.MessageType_MsgAppend:
+		//candidate收到了term>=自身的心跳，说明有新的Leader已经产生了
+		//在此时，只有m.Term == r.Term，因为若m.Term>r.term,
+		//会在step中直接变为follower
+		r.becomeFollower(m.Term, m.From)
+		r.handleAppendEntries(m)
+	}
+}
+
+func (r *Raft) stepLeader(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgBeat:
+		r.broadCastHeartBeat()
+
+	}
+
+}
+
+func (r *Raft) startElection() {
+	//首先，变为Candidate
+	r.becomeCandidate()
+	//修改votes状态信息，为自己投一票
+	_, _, res := r.pollAndCountVotes(r.id, true)
+	if res {
+		//只有一个节点，直接成为Leader
+		r.becomeLeader()
+		return
+	}
+	//给其他peer发送投票请求
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		lastIndex := r.RaftLog.LastIndex()
+		lastTerm, _ := r.RaftLog.Term(lastIndex)
+		r.send(pb.Message{Term: r.Term, To: id, MsgType: pb.MessageType_MsgRequestVote, Index: lastIndex, LogTerm: lastTerm})
+	}
+}
+
+func (r *Raft) pollAndCountVotes(id uint64, voteResult bool) (int, int, bool) {
+	//修改votes
+	r.votes[id] = voteResult
+	granted, rejected := 0, 0
+	for peerId := range r.Prs {
+		v, ok := r.votes[peerId]
+		if !ok {
+			//peerId的票还没有结果
+			continue
+		}
+		if v {
+			//peerId同意投票
+			granted++
+		} else {
+			//peerId拒绝投票
+			rejected++
+		}
+	}
+	return granted, rejected, granted >= int(len(r.Prs)/2)+1
+}
+
+func (r *Raft) broadCastHeartBeat() {
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		r.send(pb.Message{To: id, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat})
+	}
 }
