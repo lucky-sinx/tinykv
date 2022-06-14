@@ -98,14 +98,14 @@ func (l *RaftLog) maybeCompact() {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	//return nil
-	return l.entries[l.stabled+1:]
+	return l.entries[int(l.stabled-l.dummyIndex):]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	//return nil
-	return l.entries[l.applied+1 : l.committed+1]
+	return l.entries[int(l.applied-l.dummyIndex):int(l.committed-l.dummyIndex)]
 }
 
 // LastIndex return the last index of the log entries
@@ -139,17 +139,17 @@ func (l *RaftLog) firstIndex() uint64 {
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	//有效term范围[l.dummyIndex,l.lastIndex]
-	if i < l.dummyIndex || i > l.LastIndex() {
+	if i <= l.dummyIndex || i > l.LastIndex() {
 		return 0, nil
 	}
-	term, err := l.storage.Term(i)
-	if err != nil {
-		if err == ErrCompacted || err == ErrUnavailable {
-			return 0, err
-		} else {
-			panic(err)
-		}
-	}
+	term := l.entries[i-l.firstIndex()].Term
+	//if err != nil {
+	//	if err == ErrCompacted || err == ErrUnavailable {
+	//		return 0, err
+	//	} else {
+	//		panic(err)
+	//	}
+	//}
 	return term, nil
 }
 
@@ -161,4 +161,59 @@ func (l *RaftLog) appliedTo(i uint64) {
 		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
 	}
 	l.applied = i
+}
+
+func (l *RaftLog) truncateAndAppend(entries []*pb.Entry) {
+	//第一条数据索引
+	index := entries[0].Index
+	switch {
+	case index == l.LastIndex()+1:
+		//entries[0].Index==lastLogIndex+1,说明是完全新增的数据,直接append
+		for i := range entries {
+			l.entries = append(l.entries, *entries[i])
+		}
+	case index <= l.LastIndex():
+		//需要删除index和之后的日志，再append，并修改storage还有stabled的值
+		l.entries = l.entries[:index-l.dummyIndex-1]
+		for i := range entries {
+			l.entries = append(l.entries, *entries[i])
+		}
+		if index <= l.stabled {
+			//index..stabled...
+			//把[index,stabled]的日志也删掉了，需要更新stabled值
+			l.stabled = index - 1
+		}
+	}
+
+}
+
+func (l *RaftLog) matchTerm(index uint64, term uint64) bool {
+	t, err := l.Term(index)
+	if err != nil {
+		return false
+	}
+	return t == term
+}
+
+func (l *RaftLog) findConflictIndex(entries []*pb.Entry) {
+
+}
+
+func (l *RaftLog) tryCommit(commit uint64, nowTerm uint64) bool {
+	// 获取commit对应地term值
+	term, err := l.Term(commit)
+	if err != nil {
+		return false
+	}
+	if commit > l.committed && term == nowTerm {
+		l.commitTo(commit)
+		return true
+	}
+	return false
+}
+
+func (l *RaftLog) commitTo(commit uint64) {
+	if l.committed < commit {
+		l.committed = min(l.LastIndex(), commit)
+	}
 }
