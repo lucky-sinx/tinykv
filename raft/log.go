@@ -217,3 +217,8 @@ func (l *RaftLog) commitTo(commit uint64) {
 		l.committed = min(l.LastIndex(), commit)
 	}
 }
+
+func (l *RaftLog) commitedEntries() []pb.Entry {
+	//返回[l.applied+1:l.commited+1)的日志
+	return l.entries[l.applied-l.dummyIndex : l.committed-l.dummyIndex]
+}

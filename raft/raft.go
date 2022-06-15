@@ -42,6 +42,8 @@ var stmap = [...]string{
 	"StateLeader",
 }
 
+var debug = false
+
 type lockedRand struct {
 	mu   sync.Mutex
 	rand *rand.Rand
@@ -188,12 +190,15 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	hardState, _, err := c.Storage.InitialState()
+	hardState, confState, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err)
 	}
+	peers := c.peers
+	if len(confState.Nodes) > 0 {
+		peers = confState.Nodes
+	}
 	raftLog := newLog(c.Storage)
-
 	raft := &Raft{
 		id:               c.ID,
 		Lead:             None,
@@ -203,6 +208,13 @@ func newRaft(c *Config) *Raft {
 		heartbeatTimeout: c.HeartbeatTick,
 		logger:           log.New(),
 	}
+	if debug {
+		raft.logger.SetLevel(log.LOG_LEVEL_DEBUG)
+	}
+
+	for _, peer := range peers { //这里有点问题，restart时peer是空的，应该从ConfState中拿
+		raft.Prs[peer] = &Progress{Next: 1, Match: 0}
+	}
 
 	if !IsEmptyHardState(hardState) {
 		if hardState.Commit < raft.RaftLog.committed || hardState.Commit > raft.RaftLog.LastIndex() {
@@ -211,10 +223,6 @@ func newRaft(c *Config) *Raft {
 		raft.Term = hardState.Term
 		raft.Vote = hardState.Vote
 		raft.RaftLog.committed = hardState.Commit
-	}
-
-	for _, peer := range c.peers { //这里有点问题，restart时peer是空的，应该从config中拿
-		raft.Prs[peer] = &Progress{Next: 1, Match: 0}
 	}
 
 	if c.Applied > 0 {
@@ -298,7 +306,7 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.State = StateLeader
 	// NOTE: Leader should propose a noop entry on its term
-	//r.logger.Infof("%x become leader at term %+v", r.id, r.Term)
+	r.logger.Debugf("%x become leader at term %+v", r.id, r.Term)
 
 	r.appendEntry(&pb.Entry{Data: nil})
 }
@@ -448,10 +456,12 @@ func (r *Raft) reset(term uint64) {
 	r.votes = make(map[uint64]bool)
 	for peerId := range r.Prs {
 		//只有Leader节点用得到这个数据
-		r.Prs[peerId] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
 		if peerId == r.id {
 			r.Prs[peerId].Match = r.RaftLog.LastIndex()
 		}
+	}
+	if _, ok := r.Prs[r.id]; !ok {
+		r.Prs[r.id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
 	}
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 
