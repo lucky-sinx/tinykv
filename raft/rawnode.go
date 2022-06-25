@@ -157,6 +157,12 @@ func (rn *RawNode) Ready() Ready {
 
 	// SoftState will be nil if there is no update.
 	// HardState will be equal to empty state if there is no update.
+	ready := Ready{
+		Entries:          rn.Raft.RaftLog.unstableEntries(),
+		CommittedEntries: rn.Raft.RaftLog.commitedEntries(),
+		Messages:         rn.Raft.msgs,
+	}
+
 	nowSoftState := &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
 	nowHardState := pb.HardState{
 		Term:   rn.Raft.Term,
@@ -169,13 +175,13 @@ func (rn *RawNode) Ready() Ready {
 	if !IsEmptyHardState(rn.lastHardState) && isHardStateEqual(nowHardState, rn.lastHardState) {
 		nowHardState = pb.HardState{}
 	}
+	ready.HardState = nowHardState
+	ready.SoftState = nowSoftState
 
-	return Ready{
-		SoftState:        nowSoftState,
-		HardState:        nowHardState,
-		Entries:          rn.Raft.RaftLog.unstableEntries(),
-		CommittedEntries: rn.Raft.RaftLog.commitedEntries(),
-	}
+	ready.Messages = rn.Raft.msgs
+	rn.Raft.msgs = []pb.Message{}
+
+	return ready
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
@@ -197,6 +203,9 @@ func (rn *RawNode) HasReady() bool {
 		return true
 	}
 	if len(rn.Raft.RaftLog.commitedEntries()) != 0 {
+		return true
+	}
+	if len(rn.Raft.msgs) > 0 {
 		return true
 	}
 	return false

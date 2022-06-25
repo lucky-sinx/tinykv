@@ -254,6 +254,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 		var entries []*pb.Entry
 		for i := nextIndex; i <= r.RaftLog.LastIndex(); i++ {
+
 			entries = append(entries, &r.RaftLog.entries[i-r.RaftLog.firstIndex()])
 		}
 		m.Entries = entries
@@ -306,7 +307,7 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.State = StateLeader
 	// NOTE: Leader should propose a noop entry on its term
-	r.logger.Debugf("%x become leader at term %+v", r.id, r.Term)
+	log.Debugf("%x become leader at term %+v", r.id, r.Term)
 
 	r.appendEntry(&pb.Entry{Data: nil})
 }
@@ -456,9 +457,13 @@ func (r *Raft) reset(term uint64) {
 	r.votes = make(map[uint64]bool)
 	for peerId := range r.Prs {
 		//只有Leader节点用得到这个数据
+		r.Prs[peerId].Next = r.RaftLog.LastIndex() + 1
+		r.Prs[peerId].Match = 0
 		if peerId == r.id {
 			r.Prs[peerId].Match = r.RaftLog.LastIndex()
 		}
+		//log.Debugf("%d!!!!!!!!!!!%+v", peerId, r.Prs[peerId])
+
 	}
 	if _, ok := r.Prs[r.id]; !ok {
 		r.Prs[r.id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
