@@ -18,14 +18,52 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
+// Debugging
+const Debug = true
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+// 随机n以内的值，因后续有开raft集群都用到，自己加锁
+type lockedRand struct {
+	mu   sync.Mutex
+	rand *rand.Rand
+}
+
+func (l *lockedRand) Intn(n int) int {
+	l.mu.Lock()
+	v := l.rand.Intn(n)
+	l.mu.Unlock()
+	return v
+}
+
+var globalRand = &lockedRand{
+	rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+}
+
+func getEntries(ents []*pb.Entry) []pb.Entry {
+	res := make([]pb.Entry, 0)
+	for _, ent := range ents {
+		res = append(res, *ent)
+	}
+	return res
+}
 func min(a, b uint64) uint64 {
 	if a > b {
 		return b

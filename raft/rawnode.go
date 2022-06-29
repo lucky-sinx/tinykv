@@ -16,7 +16,6 @@ package raft
 
 import (
 	"errors"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -31,6 +30,10 @@ var ErrStepPeerNotFound = errors.New("raft: cannot step as peer not found")
 type SoftState struct {
 	Lead      uint64
 	RaftState StateType
+}
+
+func (ss *SoftState) equal(b *SoftState) bool {
+	return ss.Lead == b.Lead && ss.RaftState == b.RaftState
 }
 
 // Ready encapsulates the entries and messages that are ready to read,
@@ -70,12 +73,21 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	// 上一次Ready时的数据
+	prevSoftSt *SoftState
+	prevHardSt pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	r := newRaft(config)
+	rn := &RawNode{
+		Raft:       r,
+		prevSoftSt: r.softState(),
+		prevHardSt: r.hardState(),
+	}
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,12 +155,47 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	r := rn.Raft
+	rd := Ready{
+		Entries:          r.RaftLog.unstableEntries(),
+		CommittedEntries: r.RaftLog.nextEnts(),
+		Messages:         r.msgs,
+	}
+
+	if len(rd.Messages) == 0 {
+		rd.Messages = nil
+	}
+	// raft消息丢失不影响
+	r.msgs = []pb.Message{}
+
+	if softSt := r.softState(); !softSt.equal(rn.prevSoftSt) {
+		rd.SoftState = softSt
+	}
+	if hardSt := r.hardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardSt) {
+		rd.HardState = hardSt
+	}
+	if r.RaftLog.pendingSnapshot != nil {
+		rd.Snapshot = *r.RaftLog.pendingSnapshot
+	}
+	return rd
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	r := rn.Raft
+	if !r.softState().equal(rn.prevSoftSt) {
+		return true
+	}
+	if hardSt := r.hardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardSt) {
+		return true
+	}
+	if r.RaftLog.hasPendingSnapshot() {
+		return true
+	}
+	if len(r.msgs) > 0 || len(r.RaftLog.unstableEntries()) > 0 || r.RaftLog.hasNextEnts() {
+		return true
+	}
 	return false
 }
 
@@ -156,6 +203,37 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	r := rn.Raft
+
+	// 更新prevSoftSt和prevHardSt
+	if rd.SoftState != nil {
+		rn.prevSoftSt = rd.SoftState
+	}
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardSt = rd.HardState
+	}
+
+	// 更新applyIndex
+	if rd.CommittedEntries != nil && len(rd.CommittedEntries) != 0 {
+		newApplyIndex := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		// 后面snapshot应该还要改
+		// 中途可能有snapshot更新了applyIndex
+		r.RaftLog.applied = max(r.RaftLog.applied, newApplyIndex)
+	}
+
+	// 更新raftLog.entry
+	if rd.Entries != nil && len(rd.Entries) != 0 {
+		lastStableEntry := rd.Entries[len(rd.Entries)-1]
+		if lastStableEntry.Index > r.RaftLog.stabled {
+			// 不在内存中删除
+			//tmpStableEntry := r.RaftLog.entries[lastStableEntry.Index-r.RaftLog.stabled-1]
+			//if tmpStableEntry.Term != lastStableEntry.Term || tmpStableEntry.Index != lastStableEntry.Index {
+			//	panic(fmt.Sprintf("[%v]--persistError,wantPeisist[term-%v,Index-%v],but[%v,%v]", r.id, lastStableEntry.Term, lastStableEntry.Index, tmpStableEntry.Term, tmpStableEntry.Index))
+			//}
+			//r.RaftLog.entries = r.RaftLog.entries[lastStableEntry.Index-r.RaftLog.stabled:]
+			r.RaftLog.stabled = lastStableEntry.Index
+		}
+	}
 }
 
 // GetProgress return the Progress of this node and its peers, if this
