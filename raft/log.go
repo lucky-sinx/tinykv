@@ -54,6 +54,7 @@ type RaftLog struct {
 
 	// Your Data Here (2A).
 	dummyIndex uint64
+	dummyTerm  uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -92,6 +93,22 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+
+	// 检查applyState,在内存中删除[firstIndex...truncateIndex]的entries,更新dummyIndex、dummyTerm
+	firstIndex := l.firstIndex()
+	trueNextIndex, _ := l.storage.FirstIndex()
+	//log.Infof("RaftLog compact from %d to %d", firstIndex, trueNextIndex)
+
+	if trueNextIndex > firstIndex {
+		log.Infof("RaftLog compact from %d to %d", firstIndex, trueNextIndex)
+		l.entries = l.entries[trueNextIndex-l.dummyIndex-1:]
+		l.dummyIndex = trueNextIndex - 1
+		term, err := l.storage.Term(l.dummyIndex)
+		if err != nil {
+
+		}
+		l.dummyTerm = term
+	}
 }
 
 // unstableEntries return all the unstable entries
@@ -115,6 +132,7 @@ func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) == 0 {
 		return l.dummyIndex
 	}
+
 	return l.entries[0].Index + uint64(len(l.entries)) - 1
 }
 
@@ -139,17 +157,16 @@ func (l *RaftLog) firstIndex() uint64 {
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	//有效term范围[l.dummyIndex,l.lastIndex]
-	if i <= l.dummyIndex || i > l.LastIndex() {
-		return 0, nil
+	if i < l.dummyIndex {
+		return 0, ErrCompacted
+	}
+	if i > l.LastIndex() {
+		return 0, ErrUnavailable
+	}
+	if i == l.dummyIndex {
+		return l.dummyTerm, nil
 	}
 	term := l.entries[i-l.firstIndex()].Term
-	//if err != nil {
-	//	if err == ErrCompacted || err == ErrUnavailable {
-	//		return 0, err
-	//	} else {
-	//		panic(err)
-	//	}
-	//}
 	return term, nil
 }
 

@@ -68,6 +68,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
+	//log.Infof("1111")
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
 		raftMsg := msg.Data.(*rspb.RaftMessage)
@@ -75,6 +76,7 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 			log.Errorf("%s handle raft message error %v", d.Tag, err)
 		}
 	case message.MsgTypeRaftCmd:
+
 		raftCMD := msg.Data.(*message.MsgRaftCmd)
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
@@ -152,7 +154,14 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		}
 		d.RaftGroup.Propose(data)
 	} else {
-
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			data, err := msg.Marshal()
+			if err != nil {
+				panic(err)
+			}
+			d.RaftGroup.Propose(data)
+		}
 	}
 }
 
@@ -453,6 +462,7 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 	firstIdx, _ := d.peerStorage.FirstIndex()
 	var compactIdx uint64
 	if appliedIdx > firstIdx && appliedIdx-firstIdx >= d.ctx.cfg.RaftLogGcCountLimit {
+		// 目前存储的日志大于RaftLogGcCountLimit就进行快照
 		compactIdx = appliedIdx
 	} else {
 		return
@@ -601,11 +611,9 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry) {
 		var responses = make([]*raft_cmdpb.Response, 0) //d.commitNormalRequests(msg)
 
 		msg.Unmarshal(e.Data)
-		log.Debugf("hhhh%v-%d", msg, len(msg.Requests))
 
 		if len(msg.Requests) > 0 {
 			for _, request := range msg.Requests {
-				log.Debugf("88888888888888888888888888%v", request)
 				switch request.CmdType {
 				case raft_cmdpb.CmdType_Get:
 					value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, request.Get.Cf, request.Get.Key)
@@ -646,7 +654,14 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry) {
 			}
 		}
 		if msg.AdminRequest != nil {
-			d.commitAdminRequest(msg)
+			switch msg.AdminRequest.CmdType {
+			case raft_cmdpb.AdminCmdType_CompactLog:
+				index, term := msg.AdminRequest.CompactLog.CompactIndex, msg.AdminRequest.CompactLog.CompactTerm
+				d.peerStorage.applyState.TruncatedState.Index = index
+				d.peerStorage.applyState.TruncatedState.Term = term
+				writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+				d.ScheduleCompactLog(index) //启动一个异步任务进行磁盘上的日志删除工作
+			}
 		}
 
 		writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
@@ -657,10 +672,6 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry) {
 }
 
 func (d *peerMsgHandler) commitNormalRequests(cmd *raft_cmdpb.RaftCmdRequest) {
-
-}
-
-func (d *peerMsgHandler) commitAdminRequest(cmd *raft_cmdpb.RaftCmdRequest) {
 
 }
 

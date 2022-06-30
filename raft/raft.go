@@ -199,6 +199,8 @@ func newRaft(c *Config) *Raft {
 		peers = confState.Nodes
 	}
 	raftLog := newLog(c.Storage)
+	term, _ := c.Storage.Term(raftLog.firstIndex() - 1)
+	raftLog.dummyTerm = term
 	raft := &Raft{
 		id:               c.ID,
 		Lead:             None,
@@ -212,7 +214,7 @@ func newRaft(c *Config) *Raft {
 		raft.logger.SetLevel(log.LOG_LEVEL_DEBUG)
 	}
 
-	for _, peer := range peers { //这里有点问题，restart时peer是空的，应该从ConfState中拿
+	for _, peer := range peers { //这里有点问题，restart时peer是空的，应该从ConfState中拿--------->已修复
 		raft.Prs[peer] = &Progress{Next: 1, Match: 0}
 	}
 
@@ -244,7 +246,18 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	if errt != nil {
 		//Snapshot
+		m.MsgType = pb.MessageType_MsgSnapshot
+		m.Term = r.Term
 
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				r.logger.Debugf("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				return false
+			}
+			panic(err)
+		}
+		m.Snapshot = &snapshot
 	} else {
 		//AppendEntries操作
 		m.MsgType = pb.MessageType_MsgAppend
@@ -254,7 +267,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 		var entries []*pb.Entry
 		for i := nextIndex; i <= r.RaftLog.LastIndex(); i++ {
-
 			entries = append(entries, &r.RaftLog.entries[i-r.RaftLog.firstIndex()])
 		}
 		m.Entries = entries
@@ -267,7 +279,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	r.send(pb.Message{To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat})
+	r.send(pb.Message{To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat, Commit: min(r.Prs[to].Match, r.RaftLog.committed)})
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -324,8 +336,8 @@ func (r *Raft) Step(m pb.Message) error {
 		//本地消息
 	case m.Term > r.Term:
 		//收到具有更大Term的消息
-		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend {
-			//已经有新Leader了，发送来心跳或者AE
+		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgSnapshot {
+			//已经有新Leader了，发送来心跳或者AE或者snapshot
 			r.becomeFollower(m.Term, m.From)
 		} else {
 			//有新的Candidate来请求投票了
@@ -397,14 +409,14 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			//传入的数据出错，how?
 			r.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", conflictIndex, r.RaftLog.committed)
 		} else {
-			//r.appendEntry(m.Entries[conflictIndex-m.Index-1:]...) //这是Leader才自主进行的append方法
+			//r.appendEntry(m.Entries[conflictIndex-m.Index-1:]...) //这是Leader自主进行的append方法
 			r.RaftLog.truncateAndAppend(m.Entries)
 		}
 
 		// If leaderCommit > commitIndex, set commitIndex =
 		// min(leaderCommit, index of last new entry)
 		r.RaftLog.commitTo(min(m.Commit, lastNew))
-		response.Index = lastNew
+		response.Index = r.RaftLog.LastIndex()
 	} else {
 		// Reply false if log doesn’t contain an entry at prevLogIndex
 		// whose term matches prevLogTerm (§5.3)
@@ -425,6 +437,26 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	index, _ := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	if index <= r.RaftLog.committed {
+		// truncateIndex<=committed 忽略此快照
+	} else {
+		// 设置了pendingSnapshot后要清空entries，同时更新其他的信息
+		truncateIndex := m.Snapshot.Metadata.Index
+		truncateTerm := m.Snapshot.Metadata.Term
+		r.RaftLog.entries = []pb.Entry{}
+		r.RaftLog.pendingSnapshot = m.Snapshot
+		r.RaftLog.committed = truncateIndex
+		r.RaftLog.applied = truncateIndex
+		r.RaftLog.stabled = truncateIndex
+		r.RaftLog.dummyIndex = truncateIndex
+		r.RaftLog.dummyTerm = truncateTerm
+		r.Prs = make(map[uint64]*Progress)
+		for _, node := range m.Snapshot.Metadata.ConfState.Nodes {
+			r.Prs[node] = &Progress{}
+		}
+	}
+	r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()})
 }
 
 // addNode add a new node to raft group
@@ -490,8 +522,10 @@ func (r *Raft) tickHeartBeat() {
 
 func (r *Raft) send(message pb.Message) {
 	message.From = r.id
-	//r.logger.Infof("%x send msg %+v", r.id, message)
 	r.msgs = append(r.msgs, message)
+	//r.logger.Infof()
+
+	//log.Infof("%x send msg %+v LEN(MSG)=%d", r.id, message, len(r.msgs))
 }
 
 func (r *Raft) stepFollower(m pb.Message) {
@@ -511,6 +545,10 @@ func (r *Raft) stepFollower(m pb.Message) {
 		r.electionElapsed = 0
 		r.Lead = m.From
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgSnapshot:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleSnapshot(m)
 	}
 
 }
@@ -540,6 +578,9 @@ func (r *Raft) stepCandidate(m pb.Message) {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgPropose:
 		//收到本地的prop请求，然而candidate并不知道Leader，丢弃请求
+	case pb.MessageType_MsgSnapshot:
+		r.becomeFollower(r.Term, m.From)
+		r.handleSnapshot(m)
 	}
 }
 
