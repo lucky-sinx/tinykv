@@ -48,27 +48,45 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// Your Code Here (2B).
 	if d.RaftGroup.HasReady() {
 		ready := d.RaftGroup.Ready()
+		log.Debugf("%v hasReady:%+v", d.Tag, ready)
+		log.Debugf("%v before handle Ready applyState=%+v,softState=%+v", d.Tag, d.peerStorage.applyState, d.peerStorage.raftState)
+
 		// 持久化log、元数据到磁盘
-		_, err := d.peerStorage.SaveReadyState(&ready)
+		applyResult, err := d.peerStorage.SaveReadyState(&ready)
 		if err != nil {
 			panic(err)
 		}
-		// 发送msg
-		if len(ready.Messages) > 0 {
-			d.Send(d.ctx.trans, ready.Messages)
+		if applyResult != nil {
+
 		}
+		// 发送msg
+		d.Send(d.ctx.trans, ready.Messages)
 
 		// 处理commited entries
-		for _, entry := range ready.CommittedEntries {
-			d.applyEntry(&entry)
+		//for _, entry := range ready.CommittedEntries {
+		//	d.applyEntry(&entry)
+		//}
+
+		if len(ready.CommittedEntries) > 0 {
+			kvWB := &engine_util.WriteBatch{}
+			for _, entry := range ready.CommittedEntries {
+				d.applyEntry(&entry, kvWB)
+			}
+			d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
+			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			kvWB.WriteToDB(d.peerStorage.Engines.Kv)
 		}
 		// 调用advance
 		d.RaftGroup.Advance(ready)
+		log.Debugf("%v after handle Ready applyState=%+v,softState=%+v", d.Tag, d.peerStorage.applyState, d.peerStorage.raftState)
+	} else {
+		//log.Debugf("%d-%v has not ready", d.RaftGroup.Raft.GetId(), d.RaftGroup.Raft.State)
+
 	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
-	//log.Infof("1111")
+	//log.Debugf("1111")
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
 		raftMsg := msg.Data.(*rspb.RaftMessage)
@@ -601,9 +619,8 @@ func (d *peerMsgHandler) onGCSnap(snaps []snap.SnapKeyWithSending) {
 	}
 }
 
-func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry) {
-	writeBatch := &engine_util.WriteBatch{}
-
+func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.WriteBatch) {
+	//writeBatch := &engine_util.WriteBatch{}
 	switch e.EntryType {
 	case eraftpb.EntryType_EntryNormal:
 		var msg = &raft_cmdpb.RaftCmdRequest{}
@@ -633,7 +650,7 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry) {
 					})
 
 				case raft_cmdpb.CmdType_Put:
-
+					//log.Infof("%v put key=%v,value=%v", d.Tag, string(request.Put.Key), string(request.Put.Value))
 					writeBatch.SetCF(request.Put.Cf, request.Put.Key, request.Put.Value)
 					responses = append(responses, &raft_cmdpb.Response{
 						CmdType: raft_cmdpb.CmdType_Put,
@@ -657,14 +674,17 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry) {
 			switch msg.AdminRequest.CmdType {
 			case raft_cmdpb.AdminCmdType_CompactLog:
 				index, term := msg.AdminRequest.CompactLog.CompactIndex, msg.AdminRequest.CompactLog.CompactTerm
-				d.peerStorage.applyState.TruncatedState.Index = index
-				d.peerStorage.applyState.TruncatedState.Term = term
-				writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-				d.ScheduleCompactLog(index) //启动一个异步任务进行磁盘上的日志删除工作
+				if index >= d.peerStorage.applyState.TruncatedState.Index {
+					d.peerStorage.applyState.TruncatedState.Index = index
+					d.peerStorage.applyState.TruncatedState.Term = term
+					writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					d.ScheduleCompactLog(index) //启动一个异步任务进行磁盘上的日志删除工作
+				}
 			}
 		}
 
 		writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+		writeBatch.Reset()
 		d.handleResponse(e, &raft_cmdpb.RaftCmdResponse{Header: header, Responses: responses})
 	case eraftpb.EntryType_EntryConfChange:
 
@@ -677,30 +697,54 @@ func (d *peerMsgHandler) commitNormalRequests(cmd *raft_cmdpb.RaftCmdRequest) {
 
 func (d *peerMsgHandler) handleResponse(e *eraftpb.Entry, r *raft_cmdpb.RaftCmdResponse) {
 	// find the proposal
-
-	if len(d.proposals) == 0 {
-		return
-	}
-	index, term := e.Index, e.Term
-	var i int
-	for i = 0; i < len(d.proposals); i++ {
-		if d.proposals[i].index == index {
-			break
+	eindex, eterm := e.Index, e.Term
+	for len(d.proposals) > 0 {
+		p := d.proposals[0]
+		pterm, pindex := p.term, p.index
+		if pterm < eterm {
+			//stale proposal
+			p.cb.Done(ErrRespStaleCommand(pterm))
+			d.proposals = d.proposals[1:]
+		} else if pterm == eterm {
+			if pindex < eindex {
+				//stale proposal
+				p.cb.Done(ErrRespStaleCommand(pterm))
+				d.proposals = d.proposals[1:]
+			} else if pindex == eindex {
+				// find the proposal, done and return
+				if len(r.Responses) > 0 && r.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
+					p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				}
+				p.cb.Done(r)
+				d.proposals = d.proposals[1:]
+				return
+			} else if pindex > eindex {
+				return
+			}
+		} else if pterm > eterm {
+			return
 		}
 	}
-	if i >= len(d.proposals) {
-		return
-	}
-	if len(r.Responses) > 0 && r.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
-		d.proposals[i].cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-	}
-	// proposal.Done()
-	if d.proposals[i].term != term {
-		NotifyStaleReq(term, d.proposals[i].cb)
-		return
-	}
-	d.proposals[i].cb.Done(r)
-	d.proposals = d.proposals[i+1:]
+
+	//var i int
+	//for i = 0; i < len(d.proposals); i++ {
+	//	if d.proposals[i].index == index {
+	//		break
+	//	}
+	//}
+	//if i >= len(d.proposals) {
+	//	return
+	//}
+	//if len(r.Responses) > 0 && r.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
+	//	d.proposals[i].cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+	//}
+	//// proposal.Done()
+	//if d.proposals[i].term != term {
+	//	NotifyStaleReq(term, d.proposals[i].cb)
+	//	return
+	//}
+	//d.proposals[i].cb.Done(r)
+	//d.proposals = d.proposals[i+1:]
 }
 
 func newAdminRequest(regionID uint64, peer *metapb.Peer) *raft_cmdpb.RaftCmdRequest {

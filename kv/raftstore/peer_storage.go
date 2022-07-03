@@ -258,6 +258,7 @@ func (ps *PeerStorage) clearMeta(kvWB, raftWB *engine_util.WriteBatch) error {
 func (ps *PeerStorage) clearExtraData(newRegion *metapb.Region) {
 	oldStartKey, oldEndKey := ps.region.GetStartKey(), ps.region.GetEndKey()
 	newStartKey, newEndKey := newRegion.GetStartKey(), newRegion.GetEndKey()
+	//log.Infof("%v want applySnapshot,%+v,%+v,%+v,%+v", ps.Tag, oldStartKey, oldEndKey, newStartKey, newEndKey)
 	if bytes.Compare(oldStartKey, newStartKey) < 0 {
 		ps.clearRange(newRegion.Id, oldStartKey, newStartKey)
 	}
@@ -308,19 +309,19 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
-
 	if len(entries) == 0 {
 		return nil
 	}
 	firstEntryIndex, lastEntryIndex := entries[0].Index, entries[len(entries)-1].Index
 	lastIndex, _ := ps.LastIndex()
 	firstIndex, _ := ps.FirstIndex()
+	log.Debugf("%v want to append entries %+v with %#v,%#v,%#v,%#v", ps.Tag, entries, firstIndex, lastIndex, firstEntryIndex, lastEntryIndex)
 
 	// ...firstEntryIndex...lastEntryIndex...firstIndex...lastIndex...
 	// ...firstIndex...lastIndex+1...firstEntryIndex...lastEntryIndex...
 	if lastEntryIndex < firstIndex || firstEntryIndex > lastIndex+1 {
-		return errors.Errorf("entries' index %d-%d is out of bound, firstIndex %d, lastIndex %d",
-			firstEntryIndex, lastEntryIndex, firstIndex, lastIndex)
+		//return errors.Errorf("entries' index %d-%d is out of bound, firstIndex %d, lastIndex %d",
+		//	firstEntryIndex, lastEntryIndex, firstIndex, lastIndex)
 	}
 
 	if firstEntryIndex < firstIndex {
@@ -379,8 +380,10 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 // Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
-	log.Infof("%v begin to apply snapshot", ps.Tag)
+	log.Debugf("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
+	log.Debugf("%v apply snapshot with metaData:%#v", ps.Tag, snapshot.Metadata)
+
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
 	}
@@ -389,7 +392,42 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+
+	//1.先清空原来的meta数据
+	if ps.isInitialized() {
+		err := ps.clearMeta(kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	//2.根据snapshot中的信息更新raftState、applyState
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.snapState.StateType = snap.SnapState_Applying
+	log.Debugf("%v apply update applyState=%#v,raftState=%#v", ps.Tag, ps.applyState, ps.raftState)
+	kvWB.SetMeta(meta.ApplyStateKey(ps.region.GetId()), ps.applyState)
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.GetId()), ps.raftState)
+
+	//3.发送 RegionTaskApply 来apply snapshot
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: ps.region.Id,
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.StartKey,
+		EndKey:   snapData.Region.EndKey,
+	}
+	<-ch
+	ps.region = snapData.Region
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	//kvWB.DeleteMeta(meta.RegionStateKey(regionID))
+	//kvWB.SetMeta(meta.RegionStateKey(ps.region.GetId()), ps.region)
+	return &ApplySnapResult{PrevRegion: ps.region, Region: snapData.Region}, nil
 }
 
 // Save memory states to disk.
@@ -400,17 +438,24 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	var applyResult *ApplySnapResult
 	var err error
 	raftWriteBatch := &engine_util.WriteBatch{}
+	kvWriteBatch := &engine_util.WriteBatch{}
+
+	//1.判断是否有 Snapshot，如果有 Snapshot，先调用 ApplySnapshot() 方法应用
 	if !raft.IsEmptySnap(&ready.Snapshot) {
-		kvWriteBatch := &engine_util.WriteBatch{}
-		applyResult, err = ps.ApplySnapshot(&ready.Snapshot, raftWriteBatch, kvWriteBatch)
-		kvWriteBatch.WriteToDB(ps.Engines.Kv)
+		applyResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWriteBatch, raftWriteBatch)
 	}
+
+	//2.调用 Append() 方法将需要持久化的 entries 保存到 raftDB。
 	ps.Append(ready.Entries, raftWriteBatch)
+
+	//3.判断hardState是否为空，保存 ready 中的 HardState 到 ps.raftState.HardState
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
 	raftWriteBatch.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
-	raftWriteBatch.WriteToDB(ps.Engines.Raft)
+
+	raftWriteBatch.MustWriteToDB(ps.Engines.Raft)
+	kvWriteBatch.MustWriteToDB(ps.Engines.Kv)
 
 	return applyResult, err
 }

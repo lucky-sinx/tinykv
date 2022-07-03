@@ -198,7 +198,9 @@ func newRaft(c *Config) *Raft {
 	if len(confState.Nodes) > 0 {
 		peers = confState.Nodes
 	}
+	//log.Debugf("%d want to new log", c.ID)
 	raftLog := newLog(c.Storage)
+	//log.Debugf("%d new log success", c.ID)
 	term, _ := c.Storage.Term(raftLog.firstIndex() - 1)
 	raftLog.dummyTerm = term
 	raft := &Raft{
@@ -258,6 +260,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 			panic(err)
 		}
 		m.Snapshot = &snapshot
+		r.Prs[to].Next = snapshot.Metadata.Index + 1
 	} else {
 		//AppendEntries操作
 		m.MsgType = pb.MessageType_MsgAppend
@@ -274,6 +277,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 	}
 	r.send(m)
 	return false
+}
+
+func (r *Raft) GetId() uint64 {
+	return r.id
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -442,6 +449,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		// truncateIndex<=committed 忽略此快照
 	} else {
 		// 设置了pendingSnapshot后要清空entries，同时更新其他的信息
+		log.Debugf("handleSnapshot:%#v", m.Snapshot.Metadata)
 		truncateIndex := m.Snapshot.Metadata.Index
 		truncateTerm := m.Snapshot.Metadata.Term
 		r.RaftLog.entries = []pb.Entry{}

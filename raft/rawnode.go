@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -224,6 +225,8 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	log.Debugf("%d-%v will advance ready:%+v", rn.Raft.id, rn.Raft.State, rd)
+
 	rn.lastSoftState = rd.SoftState
 	rn.lastHardState = rd.HardState
 	//这里主要是更新stabled、commited
@@ -231,12 +234,19 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
 	if len(rd.CommittedEntries) > 0 {
+		log.Debugf("%d-%v update applied from %d to %d", rn.Raft.id, rn.Raft.State, rn.Raft.RaftLog.applied, rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
 	if !IsEmptySnap(&rd.Snapshot) {
 		rn.Raft.RaftLog.pendingSnapshot = nil
 	}
+	index1 := rn.Raft.RaftLog.firstIndex()
 	rn.Raft.RaftLog.maybeCompact()
+	index2 := rn.Raft.RaftLog.firstIndex()
+	if index1 != index2 {
+		log.Debugf("%d-%v raftLog compact from %d to %d", rn.Raft.id, rn.Raft.State, index1-1, index2-1)
+	}
+	log.Debugf("%d-%v after advance: raftLog=%v", rn.Raft.id, rn.Raft.State, rn.Raft.RaftLog)
 }
 
 // GetProgress return the Progress of this node and its peers, if this

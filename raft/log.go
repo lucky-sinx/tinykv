@@ -78,6 +78,7 @@ func newLog(storage Storage) *RaftLog {
 	}
 	entries, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
+		log.Debugf("!!!!!!!!!!!%+v  %+v", firstIndex, lastIndex)
 		panic(err)
 	}
 	newLog.entries = entries
@@ -100,7 +101,6 @@ func (l *RaftLog) maybeCompact() {
 	//log.Infof("RaftLog compact from %d to %d", firstIndex, trueNextIndex)
 
 	if trueNextIndex > firstIndex {
-		log.Infof("RaftLog compact from %d to %d", firstIndex, trueNextIndex)
 		l.entries = l.entries[trueNextIndex-l.dummyIndex-1:]
 		l.dummyIndex = trueNextIndex - 1
 		term, err := l.storage.Term(l.dummyIndex)
