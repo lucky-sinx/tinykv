@@ -193,7 +193,7 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 	// 读取持久化数据
-	hardState, _, err := c.Storage.InitialState()
+	hardState, confState, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err)
 	}
@@ -215,9 +215,18 @@ func newRaft(c *Config) *Raft {
 		leadTransferee:   0,
 		PendingConfIndex: 0,
 	}
-	for _, peer := range c.peers {
-		r.Prs[peer] = &Progress{}
+
+	// 上层传节点数据时实际上是在peerStorage中，但2A的测试中是在config中传过来的
+	if confState.Nodes == nil {
+		for _, peer := range c.peers {
+			r.Prs[peer] = &Progress{}
+		}
+	} else {
+		for _, peer := range confState.Nodes {
+			r.Prs[peer] = &Progress{}
+		}
 	}
+
 	r.becomeFollower(r.Term, None)
 	if !IsEmptyHardState(hardState) {
 		r.loadHardState(hardState)
@@ -788,6 +797,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		//更新commmit
 		//nxtCommitMax := min(m.Commit, r.RaftLog.LastIndex())
 		//Leader commit了并且共享来的数据可以commit
+		//外层min可以去掉，因为反正新的entry会append上去
+		//6.824因为commit一定会同时发过来对应的entry，和这里有所不同
 		nxtCommitMax := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
 		DPrintf("[%v]--AE_Request--UpdateCommit--Success--:oldCommitIndex-%v,nxtCommitMax-%v", r.id, r.RaftLog.committed, nxtCommitMax)
 		r.RaftLog.committed = nxtCommitMax

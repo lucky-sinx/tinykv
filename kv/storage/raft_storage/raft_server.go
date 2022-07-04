@@ -136,6 +136,7 @@ func (rs *RaftStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader, erro
 		return nil, err
 	}
 
+	// 阻塞，等待Response回复
 	resp := cb.WaitResp()
 	if err := rs.checkResponse(resp, 1); err != nil {
 		if cb.Txn != nil {
@@ -149,6 +150,7 @@ func (rs *RaftStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader, erro
 	return NewRegionReader(cb.Txn, *resp.Responses[0].GetSnap().Region), nil
 }
 
+// Raft 监听从其他Raft节点发送过来的消息
 func (rs *RaftStorage) Raft(stream tinykvpb.TinyKv_RaftServer) error {
 	for {
 		msg, err := stream.Recv()

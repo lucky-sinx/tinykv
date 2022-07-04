@@ -7,3 +7,5 @@ _tools
 /vendor
 
 /kv/server/test*
+
+/kv/test_raftstore/test*

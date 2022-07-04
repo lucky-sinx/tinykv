@@ -308,6 +308,25 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+	oldLastIndex, _ := ps.LastIndex()
+	// 删除多余的entries
+	for i := entries[len(entries)-1].Index; i <= oldLastIndex; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	}
+
+	// 添加新增entries
+	for _, entry := range entries {
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	}
+
+	// 修改raftState
+	newLastEntry := entries[len(entries)-1]
+	ps.raftState.LastIndex = newLastEntry.Index
+	ps.raftState.LastTerm = newLastEntry.Term
+
 	return nil
 }
 
@@ -331,6 +350,29 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	// 修改RaftState以及持久化日志
+	changeRaftState := false
+	changeBatch := new(engine_util.WriteBatch)
+	if ready.Entries != nil {
+		err := ps.Append(ready.Entries, changeBatch)
+		if err != nil {
+			panic(err)
+		}
+		changeRaftState = true
+	}
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+		changeRaftState = true
+	}
+	if changeRaftState {
+		changeBatch.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	}
+
+	// 最后一块修改，原子操作
+	err := ps.Engines.WriteRaft(changeBatch)
+	if err != nil {
+		panic(err)
+	}
 	return nil, nil
 }
 

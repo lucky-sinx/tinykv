@@ -32,6 +32,7 @@ func (t *ServerTransport) Send(msg *raft_serverpb.RaftMessage) error {
 	return nil
 }
 
+// SendStore 通过gRPC发送消息到storeID
 func (t *ServerTransport) SendStore(storeID uint64, msg *raft_serverpb.RaftMessage) {
 	addr := t.raftClient.GetAddr(storeID)
 	if addr != "" {

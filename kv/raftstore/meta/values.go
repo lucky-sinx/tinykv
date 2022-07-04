@@ -53,6 +53,9 @@ func InitRaftLocalState(raftEngine *badger.DB, region *metapb.Region) (*rspb.Raf
 		return nil, err
 	}
 	if err == badger.ErrKeyNotFound {
+		// Badger中未找到key，并且这个region存在peer，说明这是此store上全新的
+		// Region（一般是split产生的新Region）。需要生成初始的raftState。将
+		// LastIndex，LastTerm，HardState中的Commit均置为5
 		raftState = new(rspb.RaftLocalState)
 		raftState.HardState = new(eraftpb.HardState)
 		if len(region.Peers) > 0 {

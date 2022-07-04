@@ -120,6 +120,7 @@ func (bs *Raftstore) loadPeers() ([]*peer, error) {
 	t := time.Now()
 	kvWB := new(engine_util.WriteBatch)
 	raftWB := new(engine_util.WriteBatch)
+	// 从Badger中加载所有peer的localState以及RegionID
 	err := kvEngine.View(func(txn *badger.Txn) error {
 		// get all regions from RegionLocalState
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
@@ -281,6 +282,7 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	workers.regionWorker.Start(runner.NewRegionTaskHandler(engines, ctx.snapMgr))
 	workers.raftLogGCWorker.Start(runner.NewRaftLogGCTaskHandler())
 	workers.schedulerWorker.Start(runner.NewSchedulerTaskHandler(ctx.store.Id, ctx.schedulerClient, NewRaftstoreRouter(router)))
+	// 周期性发送tick消息
 	go bs.tickDriver.run()
 }
 

@@ -97,6 +97,7 @@ func newTickDriver(baseTickInterval time.Duration, router *router, storeTicker *
 }
 
 func (r *tickDriver) run() {
+	//time.Tick() 函数返回的是一个 channel ，每隔指定的时间就会有数据从 channel 中出来
 	timer := time.Tick(r.baseTickInterval)
 	for {
 		select {

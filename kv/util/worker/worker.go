@@ -22,6 +22,7 @@ type Starter interface {
 	Start()
 }
 
+// Start 等待任务交给snapRunner处理
 func (w *Worker) Start(handler TaskHandler) {
 	w.wg.Add(1)
 	go func() {

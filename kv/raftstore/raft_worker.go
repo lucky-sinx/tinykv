@@ -8,15 +8,18 @@ import (
 
 // raftWorker is responsible for run raft commands and apply raft logs.
 type raftWorker struct {
+	// 路由消息
 	pr *router
 
 	// receiver of messages should sent to raft, including:
 	// * raft command from `raftStorage`
 	// * raft inner messages from other peers sent by network
+	// raftCh：用于接收应该被发送到raft上的消息。(peerSender的接收端)
 	raftCh chan message.Msg
 	ctx    *GlobalContext
 
-	closeCh <-chan struct{}
+	closeCh <-chan struct {
+	}
 }
 
 func newRaftWorker(ctx *GlobalContext, pm *router) *raftWorker {
@@ -30,6 +33,7 @@ func newRaftWorker(ctx *GlobalContext, pm *router) *raftWorker {
 // run runs raft commands.
 // On each loop, raft commands are batched by channel buffer.
 // After commands are handled, we collect apply messages by peers, make a applyBatch, send it to apply channel.
+// 持续运行来检查 Raft 层的状态，如果能够进行处理那就进行处理，    不行就等待下一次循环
 func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	var msgs []message.Msg
@@ -51,9 +55,11 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 			if peerState == nil {
 				continue
 			}
+			// 处理消息的Propose
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg)
 		}
 		for _, peerState := range peerStateMap {
+			// 对于所有受到消息的节点，处理节点生成的Ready信息
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleRaftReady()
 		}
 	}

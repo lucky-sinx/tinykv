@@ -26,7 +26,8 @@ const (
 )
 
 type storeState struct {
-	id       uint64
+	id uint64
+	// 自己保存一个只读chan，传给RaftStore,只写的传给Router.storeSender
 	receiver <-chan message.Msg
 	ticker   *ticker
 }
@@ -34,6 +35,7 @@ type storeState struct {
 func newStoreState(cfg *config.Config) (chan<- message.Msg, *storeState) {
 	ch := make(chan message.Msg, 40960)
 	state := &storeState{
+		// 自己保存一个只读chan，传给RaftStore
 		receiver: (<-chan message.Msg)(ch),
 		ticker:   newStoreTicker(cfg),
 	}
@@ -177,6 +179,7 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	if ok {
 		return nil
 	}
+	// 尝试新建节点后重新发送消息
 	created, err := d.maybeCreatePeer(regionID, msg)
 	if err != nil {
 		return err

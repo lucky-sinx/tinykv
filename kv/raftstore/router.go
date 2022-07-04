@@ -19,8 +19,9 @@ type peerState struct {
 
 // router routes a message to a peer.
 type router struct {
-	peers       sync.Map // regionID -> peerState
-	peerSender  chan message.Msg
+	peers      sync.Map // regionID -> peerState
+	peerSender chan message.Msg
+	// 只写chan，只读部分在storeState.receiver中
 	storeSender chan<- message.Msg
 }
 
@@ -57,6 +58,7 @@ func (pr *router) close(regionID uint64) {
 	}
 }
 
+// 将消息异步发送给raft_worker处理
 func (pr *router) send(regionID uint64, msg message.Msg) error {
 	msg.RegionID = regionID
 	p := pr.get(regionID)
@@ -68,6 +70,7 @@ func (pr *router) send(regionID uint64, msg message.Msg) error {
 }
 
 func (pr *router) sendStore(msg message.Msg) {
+	// 只写chan,在storeState.receiver中读取
 	pr.storeSender <- msg
 }
 
@@ -85,15 +88,18 @@ func (r *RaftstoreRouter) Send(regionID uint64, msg message.Msg) error {
 	return r.router.send(regionID, msg)
 }
 
+// SendRaftMessage 发送Raft内部交互消息
 func (r *RaftstoreRouter) SendRaftMessage(msg *raft_serverpb.RaftMessage) error {
 	regionID := msg.RegionId
 	if r.router.send(regionID, message.NewPeerMsg(message.MsgTypeRaftMessage, regionID, msg)) != nil {
+		// 发送失败，尝试重新发送，先交给store_worker处理，比如节点找不到storeWorker尝试新建节点
 		r.router.sendStore(message.NewPeerMsg(message.MsgTypeStoreRaftMessage, regionID, msg))
 	}
 	return nil
 
 }
 
+// SendRaftCommand 发送外部请求，如Reader
 func (r *RaftstoreRouter) SendRaftCommand(req *raft_cmdpb.RaftCmdRequest, cb *message.Callback) error {
 	cmd := &message.MsgRaftCmd{
 		Request:  req,

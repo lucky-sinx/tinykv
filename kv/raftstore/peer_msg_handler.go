@@ -2,10 +2,13 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
@@ -27,6 +30,7 @@ const (
 )
 
 type peerMsgHandler struct {
+	// 继承自Peer
 	*peer
 	ctx *GlobalContext
 }
@@ -43,15 +47,155 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	//1. 首先判断当前是否有Ready，有则更新信息，否则继续。
+	if d.RaftGroup.HasReady() {
+		rd := d.RaftGroup.Ready()
+		//2. 通过PeerStorage中的SaveReadyState()函数来保存ready中的信息，
+		//包括Append()添加日志项和应用快照等。
+		_, err := d.peerStorage.SaveReadyState(&rd)
+		if err != nil {
+			panic(err)
+		}
+
+		//3. 发送ready中的消息。然后将已经提交的日志项应用到状态机。
+		//	首先从entries中取出日志项，从Proposals中按顺序寻找对应的callback。这里需要注意，如果存在之前index的proposal,可以进行回收处理。
+		//	依次执行Requests请求中的多个请求，构造Response统一放在RaftCmdResponse中。
+		//	更新ApplyState,写入KVDB。
+		if len(rd.Messages) != 0 {
+			// 通过ServerTransport将Ready中的Msg发送给其他节点
+			d.Send(d.ctx.trans, rd.Messages)
+		}
+		if len(rd.CommittedEntries) != 0 {
+			for _, entry := range rd.CommittedEntries {
+				kvWB := new(engine_util.WriteBatch)
+				if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+					// confChange
+				} else {
+					d.process(&entry, kvWB)
+				}
+				err := d.peerStorage.Engines.WriteKV(kvWB)
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+
+		//4. 最后通过Advance()函数来强制更新raft层的状态。
+		d.RaftGroup.Advance(rd)
+	}
+}
+
+// 将entry apply
+func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) {
+	msg := new(raft_cmdpb.RaftCmdRequest)
+	err := msg.Unmarshal(entry.Data)
+	if err != nil {
+		panic(err)
+	}
+	if msg.AdminRequest != nil {
+		// snapshot??
+	}
+	if len(msg.Requests) != 0 {
+		// apply所有外部请求
+		for _, request := range msg.Requests {
+			switch request.CmdType {
+			case raft_cmdpb.CmdType_Get:
+			case raft_cmdpb.CmdType_Put:
+				put := request.Put
+				kvWB.SetCF(put.Cf, put.Key, put.Value)
+			case raft_cmdpb.CmdType_Delete:
+				del := request.Delete
+				kvWB.DeleteCF(del.Cf, del.Key)
+			case raft_cmdpb.CmdType_Snap:
+			}
+		}
+		d.peerStorage.applyState.AppliedIndex = entry.Index
+		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		if err != nil {
+			panic(err)
+		}
+
+		// call back
+		if len(d.proposals) != 0 {
+			// p.proposal是按照index顺序插入的
+			var pro *proposal
+			// 找到index和term对应的proposal
+			for pro = d.proposals[0]; pro.term < entry.Term; pro = d.proposals[0] {
+				//ErrStaleCommand: It may due to leader changes that some logs are not committed and overrided with new leaders’ logs.
+				//But the client doesn’t know that and is still waiting for the response.
+				//So you should return this to let the client knows and retries the command again.
+				// index不匹配
+				pro.cb.Done(ErrResp(&util.ErrStaleCommand{}))
+				engine_util.DPrintf("storeID,RegionId[%v,%v] -- ErrStaleCommand-IndexLittle(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.regionId, pro.index, pro.term, entry.Index, entry.Term)
+				d.proposals = d.proposals[1:]
+				if len(d.proposals) == 0 {
+					return
+				}
+			}
+			if pro.index != entry.Index {
+				//当前entry没有对应proposal
+				return
+			}
+			if pro.term != entry.Term {
+				// term不匹配
+				pro.cb.Done(ErrRespStaleCommand(entry.Term))
+				engine_util.DPrintf("storeID,RegionId[%v,%v] -- ErrStaleCommand-TermUnMatch(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.regionId, pro.index, pro.term, entry.Index, entry.Term)
+				d.proposals = d.proposals[1:]
+				return
+			}
+
+			engine_util.DPrintf("storeID,RegionId[%v,%v] -- ApplyCommand(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, entry.Index, entry.Term, msg.Requests)
+
+			header := &raft_cmdpb.RaftResponseHeader{}
+			response := &raft_cmdpb.RaftCmdResponse{
+				Header: header,
+			}
+			// 仅Write相关操作是batch的
+			// 和824不同，貌似没有记录重复消息的地方
+			request := msg.Requests[0]
+			switch request.CmdType {
+			case raft_cmdpb.CmdType_Get:
+				get := request.Get
+				val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, get.Cf, get.Key)
+				response.Responses = []*raft_cmdpb.Response{{
+					CmdType: raft_cmdpb.CmdType_Get,
+					Get:     &raft_cmdpb.GetResponse{Value: val},
+				}}
+
+			case raft_cmdpb.CmdType_Put:
+				response.Responses = []*raft_cmdpb.Response{{
+					CmdType: raft_cmdpb.CmdType_Put,
+					Put:     &raft_cmdpb.PutResponse{},
+				}}
+
+			case raft_cmdpb.CmdType_Delete:
+				response.Responses = []*raft_cmdpb.Response{{
+					CmdType: raft_cmdpb.CmdType_Delete,
+					Delete:  &raft_cmdpb.DeleteResponse{},
+				}}
+			case raft_cmdpb.CmdType_Snap:
+				// 后面好像region可能会发生改变
+				response.Responses = []*raft_cmdpb.Response{{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+				}}
+				pro.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+			}
+			pro.cb.Done(response)
+			d.proposals = d.proposals[1:]
+		}
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	switch msg.Type {
+	// 处理Raft Message，即其他节点发送过来的Raft内部消息
 	case message.MsgTypeRaftMessage:
 		raftMsg := msg.Data.(*rspb.RaftMessage)
 		if err := d.onRaftMsg(raftMsg); err != nil {
 			log.Errorf("%s handle raft message error %v", d.Tag, err)
 		}
+	// 处理外部发送过来的消息，即Write()和Reader()
 	case message.MsgTypeRaftCmd:
 		raftCMD := msg.Data.(*message.MsgRaftCmd)
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
@@ -107,13 +251,41 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+// 对于RaftCmdRequest,进入HandleMsg之后，会调用proposeRaftCommand函数来进行Propose
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// 只有Leader才能够进行写入，需要对其进行检查
+	// 对请求进行解析,恢复到原来的normal request or admin request
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
 	}
 	// Your Code Here (2B).
+	// Normal request
+	if msg.AdminRequest == nil {
+		// 后面分区时用
+		//util.CheckKeyInRegion()
+		// 使用Proposal来保留[index, term, callback]，callback通过channel便于在后面提交的时候进行process
+		d.proposals = append(d.proposals, &proposal{
+			index: d.nextProposalIndex(),
+			term:  d.Term(),
+			cb:    cb,
+		})
+		engine_util.DPrintf("storeID,RegionId[%v,%v] -- ProposeCommand(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, d.nextProposalIndex(), d.Term(), msg.Requests)
+	}
+	var data []byte
+	data, err = msg.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	// 最后是以日志项的形式，调用RawNode中的Propose函数来写入。
+	err = d.RaftGroup.Propose(data)
+	if err != nil {
+		// 前面给的代码中作了是否是Leader的校验，貌似不需要了
+		// ErrNotLeader: the raft command is proposed on a follower. so use it to let the client try other peers.
+		// BindRespError()
+		panic(err)
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -121,9 +293,11 @@ func (d *peerMsgHandler) onTick() {
 		return
 	}
 	d.ticker.tickClock()
+	// 触发Raft的tick操作
 	if d.ticker.isOnTick(PeerTickRaft) {
 		d.onRaftBaseTick()
 	}
+	// 触发GC操作，需要propose CompactLogRequest
 	if d.ticker.isOnTick(PeerTickRaftLogGC) {
 		d.onRaftGCLogTick()
 	}
@@ -161,6 +335,7 @@ func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 	d.ctx.raftLogGCTaskSender <- raftLogGCTask
 }
 
+// 处理Raft Message，即其他节点发送过来的Raft内部消息
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	log.Debugf("%s handle raft message %s from %d to %d",
 		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
@@ -195,6 +370,7 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 		return nil
 	}
 	d.insertPeerCache(msg.GetFromPeer())
+	// 继承自Peer,所以能直接点出来
 	err = d.RaftGroup.Step(*msg.GetMessage())
 	if err != nil {
 		return err
@@ -403,8 +579,10 @@ func (d *peerMsgHandler) findSiblingRegion() (result *metapb.Region) {
 	return
 }
 
+// raft_worker接收到PeerTickRaftLogGC对应的Tick消息时调用
 func (d *peerMsgHandler) onRaftGCLogTick() {
 	d.ticker.schedule(PeerTickRaftLogGC)
+	// 只有Leader才GC
 	if !d.IsLeader() {
 		return
 	}
@@ -412,6 +590,7 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 	appliedIdx := d.peerStorage.AppliedIndex()
 	firstIdx, _ := d.peerStorage.FirstIndex()
 	var compactIdx uint64
+	// 需要满足无用Log超出RaftLogGcCountLimit才GC
 	if appliedIdx > firstIdx && appliedIdx-firstIdx >= d.ctx.cfg.RaftLogGcCountLimit {
 		compactIdx = appliedIdx
 	} else {
