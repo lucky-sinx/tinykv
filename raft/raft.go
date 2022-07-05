@@ -308,6 +308,10 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.reset(term)
 	r.Lead = lead
 	r.State = StateFollower
+	if r.leadTransferee != 0 {
+		//重置leadTransferee
+		r.leadTransferee = 0
+	}
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -470,11 +474,27 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	_, ok := r.Prs[id]
+	if ok {
+		return
+	}
+	r.Prs[id] = &Progress{
+		Next:  r.RaftLog.LastIndex(),
+		Match: 0,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	_, ok := r.Prs[id]
+	if !ok {
+		return
+	}
+	delete(r.Prs, id)
+	if id != r.id {
+		r.tryCommitAndBroadCast()
+	}
 }
 
 func (r *Raft) resetRandomElectionTimeout() {
@@ -505,11 +525,6 @@ func (r *Raft) reset(term uint64) {
 		//log.Debugf("%d!!!!!!!!!!!%+v", peerId, r.Prs[peerId])
 
 	}
-	if _, ok := r.Prs[r.id]; !ok {
-		r.Prs[r.id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
-	}
-	r.Prs[r.id].Match = r.RaftLog.LastIndex()
-
 }
 
 func (r *Raft) tickElection() {
@@ -534,6 +549,7 @@ func (r *Raft) send(message pb.Message) {
 	//r.logger.Infof()
 
 	//log.Infof("%x send msg %+v LEN(MSG)=%d", r.id, message, len(r.msgs))
+	//log.Infof("")
 }
 
 func (r *Raft) stepFollower(m pb.Message) {
@@ -557,6 +573,12 @@ func (r *Raft) stepFollower(m pb.Message) {
 		r.electionElapsed = 0
 		r.Lead = m.From
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTimeoutNow:
+		//开始新一轮的选举
+		r.electionElapsed = 0
+		r.startElection()
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 
 }
@@ -589,6 +611,8 @@ func (r *Raft) stepCandidate(m pb.Message) {
 	case pb.MessageType_MsgSnapshot:
 		r.becomeFollower(r.Term, m.From)
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 }
 
@@ -601,19 +625,28 @@ func (r *Raft) stepLeader(m pb.Message) {
 		if len(m.Entries) == 0 { //检查entries数组是否没有数据，这是一个保护性检查。
 			r.logger.Panicf("%x stepped empty MsgPropose", r.id)
 		}
-		r.appendEntry(m.Entries...) //在appendEntry里面会更新match、commit等值
-		r.broadCastAppend()
+		if r.leadTransferee == 0 { // 判断是否正在LeaderTransfer
+			r.appendEntry(m.Entries...) //在appendEntry里面会更新match、commit等值
+			r.broadCastAppend()
+		}
 	case pb.MessageType_MsgHeartbeatResponse:
 		if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
 		}
 	case pb.MessageType_MsgAppendResponse:
 		r.handleAppendResponse(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 
 }
 
 func (r *Raft) startElection() {
+	_, ok := r.Prs[r.id]
+	if !ok {
+		// has been removed from the group
+		return
+	}
 	//首先，变为Candidate
 	r.becomeCandidate()
 	//修改votes状态信息，为自己投一票
@@ -698,6 +731,16 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 			//更新match之后检测更新这个commited
 			r.tryCommitAndBroadCast()
 		}
+		// 判断是否正在LeaderTransfer以及是否满足转移条件
+		if r.leadTransferee != 0 && r.leadTransferee == m.From {
+			if r.Prs[r.leadTransferee].Match == r.RaftLog.LastIndex() {
+				// 符合条件，发送MsgTimeoutNow消息
+				r.send(pb.Message{Term: r.Term, To: r.leadTransferee, MsgType: pb.MessageType_MsgTimeoutNow})
+			} else {
+				// 发送Append消息
+				r.sendAppend(r.leadTransferee)
+			}
+		}
 	}
 }
 
@@ -712,5 +755,32 @@ func (r *Raft) tryCommitAndBroadCast() {
 		//r.logger.Infof("%x commit to %x", r.id, r.RaftLog.committed)
 		//更新了commit，要broadcast告诉大家
 		r.broadCastAppend()
+	}
+}
+
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	if r.State != StateLeader {
+		//转发此消息
+		r.send(pb.Message{Term: r.Term, To: r.Lead, MsgType: pb.MessageType_MsgTransferLeader})
+	} else {
+		if r.Lead == m.From {
+			// Transfer leadership to self, there will be noop.
+			r.leadTransferee = 0
+			return
+		}
+		_, ok := r.Prs[m.From]
+		if !ok {
+			// Transfer leadership to non-existing node, there will be noop.
+			r.leadTransferee = 0
+			return
+		}
+		r.leadTransferee = m.From
+		if r.Prs[r.leadTransferee].Match == r.RaftLog.LastIndex() {
+			// 符合条件，发送MsgTimeoutNow消息
+			r.send(pb.Message{Term: r.Term, To: r.leadTransferee, MsgType: pb.MessageType_MsgTimeoutNow})
+		} else {
+			// 发送Append消息
+			r.sendAppend(r.leadTransferee)
+		}
 	}
 }
