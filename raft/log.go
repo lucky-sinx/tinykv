@@ -91,6 +91,11 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	// 从firstIndex开始
+	firstIndex, _ := l.storage.FirstIndex()
+	if len(l.entries) != 0 && firstIndex > l.entries[0].Index {
+		l.entries = l.entries[firstIndex-l.entries[0].Index:]
+	}
 }
 
 // unstableEntries return all the unstable entries
@@ -298,6 +303,7 @@ func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
 
 func (l *RaftLog) hasPendingSnapshot() bool {
 	// 暂时未使用
-	return false
+	return !IsEmptySnap(l.pendingSnapshot)
+	//return false
 	//return l.unstable.snapshot != nil && !IsEmptySnap(*l.unstable.snapshot)
 }

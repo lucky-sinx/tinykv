@@ -2,13 +2,13 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
-	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
@@ -52,11 +52,16 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		rd := d.RaftGroup.Ready()
 		//2. 通过PeerStorage中的SaveReadyState()函数来保存ready中的信息，
 		//包括Append()添加日志项和应用快照等。
-		_, err := d.peerStorage.SaveReadyState(&rd)
+		applySnapResult, err := d.peerStorage.SaveReadyState(&rd)
 		if err != nil {
 			panic(err)
 		}
-
+		if applySnapResult != nil {
+			d.peerStorage.SetRegion(applySnapResult.Region)
+			d.ctx.storeMeta.Lock()
+			d.ctx.storeMeta.regions[d.Region().Id] = d.Region()
+			d.ctx.storeMeta.Unlock()
+		}
 		//3. 发送ready中的消息。然后将已经提交的日志项应用到状态机。
 		//	首先从entries中取出日志项，从Proposals中按顺序寻找对应的callback。这里需要注意，如果存在之前index的proposal,可以进行回收处理。
 		//	依次执行Requests请求中的多个请求，构造Response统一放在RaftCmdResponse中。
@@ -72,6 +77,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					// confChange
 				} else {
 					d.process(&entry, kvWB)
+					d.peerStorage.applyState.AppliedIndex = entry.Index
+					err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					if err != nil {
+						panic(err)
+					}
 				}
 				err := d.peerStorage.Engines.WriteKV(kvWB)
 				if err != nil {
@@ -93,7 +103,19 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 		panic(err)
 	}
 	if msg.AdminRequest != nil {
-		// snapshot??
+		// snapshot
+		request := msg.AdminRequest
+		if request.CmdType == raft_cmdpb.AdminCmdType_CompactLog {
+			//CompactLogRequest modifies metadata, namely updates the RaftTruncatedState which is in the RaftApplyState.
+			//After that, you should schedule a task to raftlog-gc worker by ScheduleCompactLog. Raftlog-gc worker will do the actual log deletion work asynchronously.
+			//修改ApplyState.RaftTruncatedState
+			d.peerStorage.applyState.TruncatedState.Index = request.CompactLog.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = request.CompactLog.CompactTerm
+			//异步删除Log,实际删除log的操作在raftLogGcTaskHandle中做
+			d.ScheduleCompactLog(request.CompactLog.CompactIndex)
+			engine_util.DPrintf("storeID,RegionId[%v,%v] -- Apply[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
+		}
+		return
 	}
 	if len(msg.Requests) != 0 {
 		// apply所有外部请求
@@ -109,42 +131,44 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 			case raft_cmdpb.CmdType_Snap:
 			}
 		}
-		d.peerStorage.applyState.AppliedIndex = entry.Index
-		err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-		if err != nil {
-			panic(err)
-		}
 
 		// call back
 		if len(d.proposals) != 0 {
 			// p.proposal是按照index顺序插入的
 			var pro *proposal
 			// 找到index和term对应的proposal
+			// 一开始以为proposals中的Index是递增的，但实际上可能Log被截断后新propose的Log Index变小了。（不知道为什么也能过测试）
+			// 但由于被截断Term肯定变大，因此Term是递增的
+
+			// 删除所有过时的proposal
 			for pro = d.proposals[0]; pro.term < entry.Term; pro = d.proposals[0] {
 				//ErrStaleCommand: It may due to leader changes that some logs are not committed and overrided with new leaders’ logs.
 				//But the client doesn’t know that and is still waiting for the response.
 				//So you should return this to let the client knows and retries the command again.
-				// index不匹配
-				pro.cb.Done(ErrResp(&util.ErrStaleCommand{}))
-				engine_util.DPrintf("storeID,RegionId[%v,%v] -- ErrStaleCommand-IndexLittle(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.regionId, pro.index, pro.term, entry.Index, entry.Term)
+				// Term不匹配
+				pro.cb.Done(ErrRespStaleCommand(entry.Term))
+				engine_util.DPrintf("storeID,RegionId[%v,%v] -- ErrStale[Normal]Command-TermUnMatch(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.regionId, pro.index, pro.term, entry.Index, entry.Term)
 				d.proposals = d.proposals[1:]
 				if len(d.proposals) == 0 {
 					return
 				}
 			}
-			if pro.index != entry.Index {
-				//当前entry没有对应proposal
-				return
-			}
-			if pro.term != entry.Term {
-				// term不匹配
-				pro.cb.Done(ErrRespStaleCommand(entry.Term))
-				engine_util.DPrintf("storeID,RegionId[%v,%v] -- ErrStaleCommand-TermUnMatch(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.regionId, pro.index, pro.term, entry.Index, entry.Term)
+			// 同Term的Index肯定递增
+			for ; pro.index < entry.Index && pro.term == entry.Term; pro = d.proposals[0] {
+				// index不匹配
+				pro.cb.Done(ErrResp(&util.ErrStaleCommand{}))
+				engine_util.DPrintf("storeID,RegionId[%v,%v] -- ErrStale[Normal]Command-IndexLittle(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.regionId, pro.index, pro.term, entry.Index, entry.Term)
 				d.proposals = d.proposals[1:]
+				if len(d.proposals) == 0 {
+					return
+				}
+			}
+			if pro.term > entry.Term || pro.index > entry.Index {
+				// 当前entry没有对应proposal
 				return
 			}
 
-			engine_util.DPrintf("storeID,RegionId[%v,%v] -- ApplyCommand(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, entry.Index, entry.Term, msg.Requests)
+			engine_util.DPrintf("storeID,RegionId[%v,%v] -- Apply[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, entry.Index, entry.Term, msg.Requests)
 
 			header := &raft_cmdpb.RaftResponseHeader{}
 			response := &raft_cmdpb.RaftCmdResponse{
@@ -271,7 +295,13 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			term:  d.Term(),
 			cb:    cb,
 		})
-		engine_util.DPrintf("storeID,RegionId[%v,%v] -- ProposeCommand(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, d.nextProposalIndex(), d.Term(), msg.Requests)
+		engine_util.DPrintf("storeID,RegionId[%v,%v] -- Propose[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, d.nextProposalIndex(), d.Term(), msg.Requests)
+	} else {
+		// compact
+		request := msg.AdminRequest
+		if request.CmdType == raft_cmdpb.AdminCmdType_CompactLog {
+			engine_util.DPrintf("storeID,RegionId[%v,%v] -- Propose[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
+		}
 	}
 	var data []byte
 	data, err = msg.Marshal()
@@ -324,6 +354,7 @@ func (d *peerMsgHandler) onRaftBaseTick() {
 	d.ticker.schedule(PeerTickRaft)
 }
 
+// ScheduleCompactLog 将消息异步发送出去,实际删除log的操作在raftlog_gc中做
 func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 	raftLogGCTask := &runner.RaftLogGCTask{
 		RaftEngine: d.ctx.engine.Raft,
@@ -658,6 +689,7 @@ func (d *peerMsgHandler) validateSplitRegion(epoch *metapb.RegionEpoch, splitKey
 	}
 
 	if !d.IsLeader() {
+		// region on this store is no longer leader, skipped.
 		// region on this store is no longer leader, skipped.
 		log.Infof("%s not leader, skip", d.Tag)
 		return &util.ErrNotLeader{

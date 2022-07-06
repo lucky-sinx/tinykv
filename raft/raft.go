@@ -17,6 +17,8 @@ package raft
 import (
 	"errors"
 	"fmt"
+	//"github.com/pingcap-incubator/tinykv/kv/raftstore"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"sort"
 )
@@ -248,7 +250,36 @@ func (r *Raft) send(m pb.Message) {
 	r.msgs = append(r.msgs, m)
 }
 
-func (r *Raft) dealReplicationL(to uint64) {
+// 发送snapshot
+func (r *Raft) dealSnapshot(to uint64) {
+	// pendingSnapshot为接收到的snapshot，会通过Ready往上传，如果还有的话说明此时snapshot应该是它
+	m := pb.Message{
+		MsgType: pb.MessageType_MsgSnapshot,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	}
+
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		m.Snapshot = r.RaftLog.pendingSnapshot
+	} else {
+		var err error = nil
+		tmp := pb.Snapshot{}
+		tmp, err = r.RaftLog.storage.Snapshot()
+		m.Snapshot = &tmp
+		// 初次请求开始生成snapshot，等生成以后再同步
+		if err != nil {
+			return
+		}
+	}
+	engine_util.DPrintf("RID[%v] -- Send[snapshot](snapIndex,snapTerm) -- entry-[%v,%v],to-%v,next-%v,fistIndex-%v", r.id, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term, to, r.Prs[to].Next, r.RaftLog.FirstIndex())
+
+	r.send(m)
+	// 没有snapshot的response，暂时不确定为什么在这里改Next，但好像只能这里改？
+	r.Prs[to].Next = m.Snapshot.Metadata.Index + 1
+}
+
+func (r *Raft) dealReplication(to uint64) {
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		To:      to,
@@ -284,8 +315,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 	//}
 	if p.Next < r.RaftLog.FirstIndex() {
 		//已经snapshot了
+		r.dealSnapshot(to)
 	} else {
-		r.dealReplicationL(to)
+		r.dealReplication(to)
 	}
 	return false
 }
@@ -595,6 +627,9 @@ func (r *Raft) Step(m pb.Message) error {
 	// 处理Append request
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
+	// 处理snapshot
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 
 	// 节点状态改变
@@ -809,8 +844,41 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 }
 
 // handleSnapshot handle Snapshot RPC request
+// 在step Snapshot之前，上层的snapWorker已经接收到了snapshot对应的状态机
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if m.Term < r.Term {
+		return
+	}
+	r.electionElapsed = 0
+	r.Lead = m.From
+
+	meta := m.Snapshot.Metadata
+	// 过时消息
+	if meta.Index <= r.RaftLog.committed {
+		return
+	}
+	engine_util.DPrintf("RID[%v] -- Receive[snapshot](snapIndex,snapTerm) -- entry-[%v,%v],from-%v", r.id, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term, m.From)
+	engine_util.DPrintf("RID[%v] -- myEntries-%v,from-%v", r.id, r.RaftLog.entries, m.From)
+
+	// 更新内部状态
+	r.RaftLog.applied, r.RaftLog.committed, r.RaftLog.stabled = meta.Index, meta.Index, meta.Index
+	// 删除内存中无用的Log，感觉也可以不在这里删，之后试下
+	if len(r.RaftLog.entries) != 0 {
+		if meta.Index >= r.RaftLog.LastIndex() {
+			r.RaftLog.entries = make([]pb.Entry, 0)
+		} else if meta.Index >= r.RaftLog.entries[0].Index {
+			r.RaftLog.entries = r.RaftLog.entries[meta.Index-r.RaftLog.entries[0].Index+1:]
+		}
+	}
+	engine_util.DPrintf("RID[%v] -- nextEntries-%v,from-%v,myApplyIndex-%v", r.id, r.RaftLog.entries, m.From, r.RaftLog.applied)
+
+	//meta.ConfState 2C中测试有
+	r.Prs = make(map[uint64]*Progress, 0)
+	for _, peer := range meta.ConfState.Nodes {
+		r.Prs[peer] = &Progress{}
+	}
+	r.RaftLog.pendingSnapshot = m.Snapshot
 }
 
 // addNode add a new node to raft group

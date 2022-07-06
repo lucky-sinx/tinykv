@@ -176,6 +176,7 @@ func (rn *RawNode) Ready() Ready {
 	}
 	if r.RaftLog.pendingSnapshot != nil {
 		rd.Snapshot = *r.RaftLog.pendingSnapshot
+		r.RaftLog.pendingSnapshot = nil
 	}
 	return rd
 }
@@ -234,6 +235,8 @@ func (rn *RawNode) Advance(rd Ready) {
 			r.RaftLog.stabled = lastStableEntry.Index
 		}
 	}
+	//每次peerStorage中删了Log，Memory中也要删除
+	rn.Raft.RaftLog.maybeCompact()
 }
 
 // GetProgress return the Progress of this node and its peers, if this

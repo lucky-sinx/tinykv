@@ -151,10 +151,12 @@ func (ps *PeerStorage) FirstIndex() (uint64, error) {
 	return ps.truncatedIndex() + 1, nil
 }
 
+// Snapshot 多次调用，当生成snapshot后返回最新的snapshot
 func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 	var snapshot eraftpb.Snapshot
 	if ps.snapState.StateType == snap.SnapState_Generating {
 		select {
+		// snapshot已生成，验证后返回
 		case s := <-ps.snapState.Receiver:
 			if s != nil {
 				snapshot = *s
@@ -173,6 +175,7 @@ func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 		}
 	}
 
+	//初次调用开始生成snapshot
 	if ps.snapTriedCnt >= 5 {
 		err := errors.Errorf("failed to get snapshot after %d times", ps.snapTriedCnt)
 		ps.snapTriedCnt = 0
@@ -342,7 +345,43 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	//删除所有stata和log
+	err := ps.clearMeta(kvWB, raftWB)
+	if err != nil {
+		panic(err)
+	}
+	//更新region
+	ps.clearExtraData(snapData.Region)
+
+	ps.raftState.LastIndex, ps.raftState.LastTerm = snapshot.Metadata.Index, snapshot.Metadata.Term
+	ps.raftState.HardState.Commit, ps.raftState.HardState.Term, ps.raftState.HardState.Vote = snapshot.Metadata.Index, snapshot.Metadata.Term, 0
+	raftWB.SetMeta(meta.RaftStateKey(snapData.Region.GetId()), ps.raftState)
+
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Index, ps.applyState.TruncatedState.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
+	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.GetId()), ps.applyState)
+
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	engine_util.DPrintf("RegionId[%v] -- ReadyApply[Snapshot](compactIndex,compactTerm) -- entry-[%v,%v]", snapData.Region.GetId(), snapshot.Metadata.Index, snapshot.Metadata.Term)
+
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	flag := <-ch
+	if !flag {
+		return nil, nil
+	}
+	return &ApplySnapResult{
+		PrevRegion: ps.region,
+		Region:     snapData.Region,
+	}, nil
 }
 
 // Save memory states to disk.
@@ -350,6 +389,25 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	var applySnapResult *ApplySnapResult = nil
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		raftWB := new(engine_util.WriteBatch)
+		kvWB := new(engine_util.WriteBatch)
+		var err error = nil
+		applySnapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			panic(err)
+		}
+		// .....这也写错，服了
+		err = ps.Engines.WriteKV(kvWB)
+		if err != nil {
+			panic(err)
+		}
+		err = ps.Engines.WriteRaft(raftWB)
+		if err != nil {
+			panic(err)
+		}
+	}
 	// 修改RaftState以及持久化日志
 	changeRaftState := false
 	changeBatch := new(engine_util.WriteBatch)
@@ -373,7 +431,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if err != nil {
 		panic(err)
 	}
-	return nil, nil
+	return applySnapResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {

@@ -279,7 +279,9 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	engines := ctx.engine
 	cfg := ctx.cfg
 	workers.splitCheckWorker.Start(runner.NewSplitCheckHandler(engines.Kv, NewRaftstoreRouter(router), cfg))
+	//处理如storage.snapshot发过来的RegionTaskGen任务
 	workers.regionWorker.Start(runner.NewRegionTaskHandler(engines, ctx.snapMgr))
+	//新建GCWorker异步处理Compact时日志删除
 	workers.raftLogGCWorker.Start(runner.NewRaftLogGCTaskHandler())
 	workers.schedulerWorker.Start(runner.NewSchedulerTaskHandler(ctx.store.Id, ctx.schedulerClient, NewRaftstoreRouter(router)))
 	// 周期性发送tick消息

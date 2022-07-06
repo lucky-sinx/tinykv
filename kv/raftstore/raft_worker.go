@@ -59,7 +59,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg)
 		}
 		for _, peerState := range peerStateMap {
-			// 对于所有受到消息的节点，处理节点生成的Ready信息
+			// 对于所有收到消息的节点，处理节点生成的Ready信息
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleRaftReady()
 		}
 	}

@@ -79,6 +79,7 @@ type snapContext struct {
 
 // handleGen handles the task of generating snapshot of the Region.
 func (snapCtx *snapContext) handleGen(regionId uint64, notifier chan<- *eraftpb.Snapshot) {
+	//制作applyIndex对应位置的eraftpb.Snapshot
 	snap, err := doSnapshot(snapCtx.engines, snapCtx.mgr, regionId)
 	if err != nil {
 		log.Errorf("failed to generate snapshot!!!, [regionId: %d, err : %v]", regionId, err)
@@ -139,6 +140,7 @@ func (snapCtx *snapContext) cleanUpRange(regionId uint64, startKey, endKey []byt
 	}
 }
 
+// 获取目前applyIndex位置的Index和Term
 func getAppliedIdxTermForSnapshot(raft *badger.DB, kv *badger.Txn, regionId uint64) (uint64, uint64, error) {
 	applyState := new(rspb.RaftApplyState)
 	err := engine_util.GetMetaFromTxn(kv, meta.ApplyStateKey(regionId), applyState)
@@ -204,6 +206,7 @@ func doSnapshot(engines *engine_util.Engines, mgr *snap.SnapManager, regionId ui
 	if err != nil {
 		return nil, err
 	}
+	// snapshot.Data在Lab2C中暂时用不到
 	snapshot.Data, err = snapshotData.Marshal()
 	return snapshot, err
 }

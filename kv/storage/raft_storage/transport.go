@@ -76,6 +76,7 @@ func (t *ServerTransport) WriteData(storeID uint64, addr string, msg *raft_serve
 	}
 }
 
+// SendSnapshotSock 异步进行snapshot发送，到snapRunner.Handle中处理
 func (t *ServerTransport) SendSnapshotSock(addr string, msg *raft_serverpb.RaftMessage) {
 	callback := func(err error) {
 		regionID := msg.GetRegionId()

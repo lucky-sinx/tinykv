@@ -167,6 +167,7 @@ func (l *Logger) log(t LogType, v ...interface{}) {
 }
 
 func (l *Logger) logf(t LogType, format string, v ...interface{}) {
+	//l.level = LOG_LEVEL_DEBUG
 	if l.level|LogLevel(t) != l.level {
 		return
 	}

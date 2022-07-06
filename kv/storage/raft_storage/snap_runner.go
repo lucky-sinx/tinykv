@@ -58,6 +58,7 @@ func (r *snapRunner) send(t *sendSnapTask) {
 
 const snapChunkLen = 1024 * 1024
 
+// 分块发送Snapshot
 func (r *snapRunner) sendSnap(addr string, msg *raft_serverpb.RaftMessage) error {
 	start := time.Now()
 	msgSnap := msg.GetMessage().GetSnapshot()
@@ -127,6 +128,7 @@ func (r *snapRunner) recv(t *recvSnapTask) {
 	t.callback(err)
 }
 
+// 获得到raft_serverpb.RaftMessage，以及保存snapshot
 func (r *snapRunner) recvSnap(stream tinykvpb.TinyKv_SnapshotServer) (*raft_serverpb.RaftMessage, error) {
 	head, err := stream.Recv()
 	if err != nil {
