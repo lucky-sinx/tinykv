@@ -275,7 +275,7 @@ func (r *Raft) dealSnapshot(to uint64) {
 	engine_util.DPrintf("RID[%v] -- Send[snapshot](snapIndex,snapTerm) -- entry-[%v,%v],to-%v,next-%v,fistIndex-%v", r.id, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term, to, r.Prs[to].Next, r.RaftLog.FirstIndex())
 
 	r.send(m)
-	// 没有snapshot的response，暂时不确定为什么在这里改Next，但好像只能这里改？
+	// 没有snapshot的response，直接修改NextIndex，就算失败后面也会重新匹配NextIndex
 	r.Prs[to].Next = m.Snapshot.Metadata.Index + 1
 }
 
@@ -334,6 +334,17 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		Commit: min(r.Prs[to].Match, r.RaftLog.committed),
 	}
 	r.send(m)
+
+}
+
+// Leader Transfer，触发超时选举
+func (r *Raft) sendTimeout(to uint64) {
+	DPrintf("[%v]--Begin Transfer Leader--:term-%v,to-%v", r.id, r.Term, to)
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		To:      to,
+		From:    r.id,
+	})
 }
 
 // 广播append消息
@@ -394,6 +405,13 @@ func (r *Raft) tick() {
 			})
 			DPrintf("[%v]--doHeartBeat--:begin to send HeartBeat-%v", r.id, r.Term)
 		}
+		// transferee超时取消
+		//if r.leadTransferee != None {
+		//	r.electionElapsed++
+		//	if r.electionElapsed >= r.electionTimeout {
+		//		r.leadTransferee = None
+		//	}
+		//}
 	} else {
 		r.electionElapsed++
 		// Follow,Candidate超时处理
@@ -418,6 +436,7 @@ func (r *Raft) resetTerm(term uint64) {
 	r.Lead = None
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.leadTransferee = None
 	r.resetRandomElectionTime()
 }
 
@@ -459,6 +478,10 @@ func (r *Raft) becomeLeader() {
 	DPrintf("[%v]--init--:Leader--[Term-%v,Lead-%v]\n\n", r.id, r.Term, r.Lead)
 
 	// append一条空消息
+	//使用新配置进行成员变更日志同步：
+	// no-op不仅能避免幽灵复现问题，还能保证单节点配置变更中前任变更节点与该日志的commit节点有交集，阻止上任重新当选Leader使用不同配置产生脑裂
+	// 只有该no-op提交后才能开始新的节点变更，可参考https://zhuanlan.zhihu.com/p/359206808
+	// 这里是用的老配置进行同步，日志提交后才变更节点，没有这个问题
 	r.appendEntry(&pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1})
 	r.broadcastAppend()
 }
@@ -466,17 +489,28 @@ func (r *Raft) becomeLeader() {
 // append新的日志条目
 func (r *Raft) appendEntry(entries ...*pb.Entry) {
 	lastIndex := r.RaftLog.LastIndex()
+
+	// cnt记录添加成功的entry个数
+	var cnt uint64 = 0
 	for i := range entries {
+		//需要判断是否可以config change
+		if entries[i].EntryType == pb.EntryType_EntryConfChange {
+			if r.RaftLog.applied < r.PendingConfIndex {
+				continue
+			}
+			r.PendingConfIndex = lastIndex + cnt + 1
+		}
+		cnt++
 		entries[i].Term = r.Term
-		entries[i].Index = lastIndex + uint64(i) + 1
+		entries[i].Index = lastIndex + cnt
 		r.RaftLog.entries = append(r.RaftLog.entries, *entries[i])
 	}
-	r.Prs[r.id].Match = lastIndex + uint64(len(entries))
+	r.Prs[r.id].Match = lastIndex + cnt
 	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
 	if len(r.Prs) == 1 {
 		r.updateCommitIndexL()
 	}
-	DPrintf("[%v]--AcceptCommand--:new entry at Index-[%v,%v] Term-%v", r.id, lastIndex+1, lastIndex+uint64(len(entries)), r.Term)
+	DPrintf("[%v]--AcceptCommand--:new entry at Index-[%v,%v] Term-%v", r.id, lastIndex+1, lastIndex+cnt, r.Term)
 }
 
 // 处理Leader消息
@@ -484,10 +518,41 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 	switch m.MsgType {
 	// 收到新entry
 	case pb.MessageType_MsgPropose:
+		if r.leadTransferee != None {
+			DPrintf("[%v]--rejectPropose--:doing Transfer-term-%v,to-%v", r.id, r.Term, r.leadTransferee)
+			return ErrProposalDropped
+		}
 		if m.Entries != nil && len(m.Entries) != 0 {
 			r.appendEntry(m.Entries...)
 		}
 		r.broadcastAppend()
+
+	// Leader Transfer，更改Leader，期间不propose新的日志
+	case pb.MessageType_MsgTransferLeader:
+		transferee := m.From
+		//会有重发操作
+		//if r.leadTransferee == transferee {
+		//	DPrintf("[%v]--Ignore Transfer--:same transfer-term-%v,to-%v", r.id, r.Term, transferee)
+		//	return nil
+		//}
+		if transferee == r.id {
+			DPrintf("[%v]--Ignore Transfer--:leader is self-term-%v,to-%v", r.id, r.Term, transferee)
+			return nil
+		}
+		if _, ok := r.Prs[transferee]; !ok {
+			DPrintf("[%v]--Ignore Transfer--:transferee Not exist-term-%v,to-%v", r.id, r.Term, transferee)
+			return nil
+		}
+		// 在electionTimeout内需要完成transfer，暂时不用
+		//r.electionElapsed = 0
+		r.leadTransferee = transferee
+		if r.Prs[transferee].Match == r.RaftLog.LastIndex() {
+			r.sendTimeout(transferee)
+		} else {
+			DPrintf("[%v]--Later Transfer Leader，begin send append--:term-%v,to-%v", r.id, r.Term, transferee)
+			r.sendAppend(transferee)
+		}
+
 	// 发送心跳
 	case pb.MessageType_MsgBeat:
 		r.broadcastHeartBeat()
@@ -496,8 +561,15 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 	case pb.MessageType_MsgHeartbeatResponse:
 		if r.Term >= m.Term {
 			pr := r.Prs[m.From]
-			if r.RaftLog.LastIndex() >= pr.Next {
+			if r.leadTransferee == None && r.RaftLog.LastIndex() > pr.Match {
 				r.sendAppend(m.From)
+			} else if r.leadTransferee != None {
+				// 因为有可能发了snapshot，导致transfer Leader无法确定是否append Entry成功，尝试重新执行Transfer Leader
+				r.Step(pb.Message{
+					MsgType: pb.MessageType_MsgTransferLeader,
+					To:      r.id,
+					From:    r.leadTransferee,
+				})
 			}
 		}
 
@@ -526,6 +598,9 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 			DPrintf("[%v]--AE_Response--UpdateMatch-%v--:success append to [%v],myTerm_%v", r.id, nxtMatchIndex, m.From, r.Term)
 			r.updateCommitIndexL()
 		}
+		if m.From == r.leadTransferee && r.Prs[r.leadTransferee].Match == r.RaftLog.LastIndex() {
+			r.sendTimeout(r.leadTransferee)
+		}
 	}
 
 	return nil
@@ -534,6 +609,22 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 // 处理Leader消息
 func (r *Raft) stepFollow(m *pb.Message) error {
 	switch m.MsgType {
+	// 转发Leader Transfer
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead == None {
+			DPrintf("[%v]--no leader at term-%v,Follow drop Transfer", r.id, r.Term)
+			return nil
+		}
+		m.To = r.Lead
+		r.send(*m)
+	// 收到Leader Transfer发来的MsgTimeoutNow
+	case pb.MessageType_MsgTimeoutNow:
+		r.electionElapsed = 0
+		r.Step(pb.Message{
+			MsgType: pb.MessageType_MsgHup,
+			To:      r.id,
+			From:    r.id,
+		})
 	// 发送Vote
 	case pb.MessageType_MsgHup:
 		r.broadcastVote()
@@ -541,7 +632,7 @@ func (r *Raft) stepFollow(m *pb.Message) error {
 	case pb.MessageType_MsgPropose:
 		{
 			if r.Lead == None {
-				DPrintf("[%v]--no leader at term-%v,Follow", r.id, r.Term)
+				DPrintf("[%v]--no leader at term-%v,Follow drop Propose", r.id, r.Term)
 				return ErrProposalDropped
 			}
 			m.To = r.Lead
@@ -555,9 +646,13 @@ func (r *Raft) stepFollow(m *pb.Message) error {
 // 处理Candidate消息
 func (r *Raft) stepCandidate(m *pb.Message) error {
 	switch m.MsgType {
+	// 转发Leader Transfer
+	case pb.MessageType_MsgTransferLeader:
+		DPrintf("[%v]--no leader at term-%v,Candidate drop Transfer", r.id, r.Term)
+		return nil
 	// 收到新entry，转发给Leader
 	case pb.MessageType_MsgPropose:
-		DPrintf("[%v]--no leader at term-%v,candidate", r.id, r.Term)
+		DPrintf("[%v]--no leader at term-%v,Candidate drop Propose", r.id, r.Term)
 		return ErrProposalDropped
 	// 发送Vote
 	case pb.MessageType_MsgHup:
@@ -598,6 +693,10 @@ func (r *Raft) stepCandidate(m *pb.Message) error {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	if _, ok := r.Prs[r.id]; !ok {
+		DPrintf("[%v]--Step Fail--node not exist,term-%v", r.id, r.Term)
+		return nil
+	}
 	// 来了term大的，转follow
 	if m.Term > r.Term {
 		DPrintf("[%v]--RoleChange--:get Message more Term from Peer-%v--", r.id, m.From)
@@ -859,7 +958,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		return
 	}
 	engine_util.DPrintf("RID[%v] -- Receive[snapshot](snapIndex,snapTerm) -- entry-[%v,%v],from-%v", r.id, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term, m.From)
-	engine_util.DPrintf("RID[%v] -- myEntries-%v,from-%v", r.id, r.RaftLog.entries, m.From)
+	//engine_util.DPrintf("RID[%v] -- myEntries-%v,from-%v", r.id, r.RaftLog.entries, m.From)
 
 	// 更新内部状态
 	r.RaftLog.applied, r.RaftLog.committed, r.RaftLog.stabled = meta.Index, meta.Index, meta.Index
@@ -871,7 +970,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 			r.RaftLog.entries = r.RaftLog.entries[meta.Index-r.RaftLog.entries[0].Index+1:]
 		}
 	}
-	engine_util.DPrintf("RID[%v] -- nextEntries-%v,from-%v,myApplyIndex-%v", r.id, r.RaftLog.entries, m.From, r.RaftLog.applied)
+	//engine_util.DPrintf("RID[%v] -- nextEntries-%v,from-%v,myApplyIndex-%v", r.id, r.RaftLog.entries, m.From, r.RaftLog.applied)
 
 	//meta.ConfState 2C中测试有
 	r.Prs = make(map[uint64]*Progress, 0)
@@ -884,9 +983,36 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; ok {
+		DPrintf("[%v]--AddNode-%v Fail--has exist,term-%v", r.id, id, r.Term)
+		return
+	}
+	if r.State == StateLeader {
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex() + 1,
+		}
+	} else {
+		r.Prs[id] = &Progress{}
+	}
+	DPrintf("[%v]--AddNode-%v Success--next-%v,match-%v,term-%v", r.id, id, r.Prs[id].Next, r.Prs[id].Match, r.Term)
+
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		DPrintf("[%v]--RemoveNode-%v Fail--not exist,term-%v", r.id, id, r.Term)
+		return
+	}
+	if id == r.id {
+		r.Prs = make(map[uint64]*Progress, 0)
+		return
+	}
+	delete(r.Prs, id)
+	DPrintf("[%v]--RemoveNode-%v Success--term-%v", r.id, id, r.Term)
+
+	// 更新CommitIndex
+	r.updateCommitIndexL()
 }
