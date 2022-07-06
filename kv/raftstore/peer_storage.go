@@ -388,6 +388,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
+	var applyResult *ApplySnapResult
 	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
@@ -422,12 +423,16 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		StartKey: snapData.Region.StartKey,
 		EndKey:   snapData.Region.EndKey,
 	}
-	<-ch
+	// 这里原来写了个bug导致result的prevRegion和region一样，已修复
+
+	if <-ch {
+		applyResult = &ApplySnapResult{PrevRegion: ps.region, Region: snapData.Region}
+	}
 	ps.region = snapData.Region
 	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
 	//kvWB.DeleteMeta(meta.RegionStateKey(regionID))
 	//kvWB.SetMeta(meta.RegionStateKey(ps.region.GetId()), ps.region)
-	return &ApplySnapResult{PrevRegion: ps.region, Region: snapData.Region}, nil
+	return applyResult, nil
 }
 
 // Save memory states to disk.

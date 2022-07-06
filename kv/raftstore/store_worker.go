@@ -149,19 +149,24 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 	return false, nil
 }
 
+// 处理本store所接受的消息
 func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	regionID := msg.RegionId
+	// 先尝试直接通过router.peerSender发送给raftWorker去处理
 	if err := d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeRaftMessage, Data: msg}); err == nil {
 		return nil
 	}
+	// 第一次尝试发生错误：errPeerNotFound
 	log.Debugf("handle raft message. from_peer:%d, to_peer:%d, store:%d, region:%d, msg:%+v",
 		msg.FromPeer.Id, msg.ToPeer.Id, d.storeState.id, regionID, msg.Message)
+	// msg的目标store不是自己，忽略
 	if msg.ToPeer.StoreId != d.ctx.store.Id {
 		log.Warnf("store not match, ignore it. store_id:%d, to_store_id:%d, region_id:%d",
 			d.ctx.store.Id, msg.ToPeer.StoreId, regionID)
 		return nil
 	}
 
+	// 没有RegionEpoch信息
 	if msg.RegionEpoch == nil {
 		log.Errorf("missing region epoch in raft message, ignore it. region_id:%d", regionID)
 		return nil
@@ -170,6 +175,8 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 		// Target tombstone peer doesn't exist, so ignore it.
 		return nil
 	}
+
+	// 检查消息是否是发送给stale peer
 	ok, err := d.checkMsg(msg)
 	if err != nil {
 		return err
@@ -177,6 +184,7 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	if ok {
 		return nil
 	}
+	// 尝试新建peer
 	created, err := d.maybeCreatePeer(regionID, msg)
 	if err != nil {
 		return err
@@ -184,6 +192,7 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	if !created {
 		return nil
 	}
+	// 新建成功后再次发送
 	_ = d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeRaftMessage, Data: msg})
 	return nil
 }
@@ -195,6 +204,8 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (bool, error) {
 	// we may encounter a message with larger peer id, which means
 	// current peer is stale, then we should remove current peer
+
+	// 在addNode()添加节点后，raftStore会通过后续的心跳，来调用maybeCreatePeer
 	meta := d.ctx.storeMeta
 	meta.Lock()
 	defer meta.Unlock()
