@@ -121,6 +121,7 @@ func (snapCtx *snapContext) applySnap(regionId uint64, startKey, endKey []byte, 
 
 // handleApply tries to apply the snapshot of the specified Region. It calls `applySnap` to do the actual work.
 func (snapCtx *snapContext) handleApply(regionId uint64, notifier chan<- bool, startKey, endKey []byte, snapMeta *eraftpb.SnapshotMetadata) {
+	//读取之前保存的snapshot来Apply
 	err := snapCtx.applySnap(regionId, startKey, endKey, snapMeta)
 	if err != nil {
 		notifier <- false
@@ -130,6 +131,7 @@ func (snapCtx *snapContext) handleApply(regionId uint64, notifier chan<- bool, s
 }
 
 // cleanUpRange cleans up the data within the range.
+//删除非Region内的数据
 func (snapCtx *snapContext) cleanUpRange(regionId uint64, startKey, endKey []byte) {
 	if err := engine_util.DeleteRange(snapCtx.engines.Kv, startKey, endKey); err != nil {
 		log.Fatalf("failed to delete data in range, [regionId: %d, startKey: %s, endKey: %s, err: %v]", regionId,

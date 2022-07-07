@@ -128,7 +128,7 @@ func (r *snapRunner) recv(t *recvSnapTask) {
 	t.callback(err)
 }
 
-// 获得到raft_serverpb.RaftMessage，以及保存snapshot
+// 获得到raft_serverpb.RaftMessage，以及保存snapshot到文件中，后面apply才应用
 func (r *snapRunner) recvSnap(stream tinykvpb.TinyKv_SnapshotServer) (*raft_serverpb.RaftMessage, error) {
 	head, err := stream.Recv()
 	if err != nil {

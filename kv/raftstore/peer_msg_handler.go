@@ -297,10 +297,23 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		})
 		engine_util.DPrintf("storeID,RegionId[%v,%v] -- Propose[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, d.nextProposalIndex(), d.Term(), msg.Requests)
 	} else {
-		// compact
 		request := msg.AdminRequest
+		response := &raft_cmdpb.RaftCmdResponse{
+			Header: &raft_cmdpb.RaftResponseHeader{},
+		}
+
 		if request.CmdType == raft_cmdpb.AdminCmdType_CompactLog {
+			// compact
 			engine_util.DPrintf("storeID,RegionId[%v,%v] -- Propose[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
+		} else if request.CmdType == raft_cmdpb.AdminCmdType_TransferLeader {
+			// Transfer Leader
+			d.RaftGroup.TransferLeader(request.TransferLeader.Peer.Id)
+			response.AdminResponse = &raft_cmdpb.AdminResponse{
+				CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+				TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+			}
+			cb.Done(response)
+			return
 		}
 	}
 	var data []byte

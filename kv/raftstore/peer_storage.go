@@ -351,6 +351,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		panic(err)
 	}
 	//更新region
+	//删除非Region内的数据
 	ps.clearExtraData(snapData.Region)
 
 	ps.raftState.LastIndex, ps.raftState.LastTerm = snapshot.Metadata.Index, snapshot.Metadata.Term
@@ -366,6 +367,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 	engine_util.DPrintf("RegionId[%v] -- ReadyApply[Snapshot](compactIndex,compactTerm) -- entry-[%v,%v]", snapData.Region.GetId(), snapshot.Metadata.Index, snapshot.Metadata.Term)
 
+	//读取之前保存的snapshot来Apply
 	ch := make(chan bool, 1)
 	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: snapData.Region.GetId(),
