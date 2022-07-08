@@ -49,6 +49,7 @@ const (
 
 func InitRaftLocalState(raftEngine *badger.DB, region *metapb.Region) (*rspb.RaftLocalState, error) {
 	raftState, err := GetRaftLocalState(raftEngine, region.Id)
+	//engine_util.DPrintf("regionId-%v,raftEngin-%p,LastIndex-%v", region.Id, raftEngine, raftState.LastIndex)
 	if err != nil && err != badger.ErrKeyNotFound {
 		return nil, err
 	}
@@ -75,6 +76,7 @@ func InitRaftLocalState(raftEngine *badger.DB, region *metapb.Region) (*rspb.Raf
 
 func InitApplyState(kvEngine *badger.DB, region *metapb.Region) (*rspb.RaftApplyState, error) {
 	applyState, err := GetApplyState(kvEngine, region.Id)
+	//engine_util.DPrintf("regionId-%v,kvEngine-%p,applyIndex-%v", region.Id, kvEngine, applyState.AppliedIndex)
 	if err != nil && err != badger.ErrKeyNotFound {
 		return nil, err
 	}

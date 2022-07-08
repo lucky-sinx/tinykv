@@ -250,6 +250,7 @@ func (bs *Raftstore) start(
 		schedulerClient:      schedulerClient,
 		tickDriverSender:     bs.tickDriver.newRegionCh,
 	}
+	//engine_util.DPrintf("global context--router-%p", bs.ctx.router)
 	regionPeers, err := bs.loadPeers()
 	if err != nil {
 		return err
@@ -268,6 +269,9 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	router := bs.router
 	bs.wg.Add(2) // raftWorker, storeWorker
 	rw := newRaftWorker(ctx, router)
+
+	//engine_util.DPrintf("ctxRouter-%p,router-%p", ctx.router, router)
+
 	go rw.run(bs.closeCh, bs.wg)
 	sw := newStoreWorker(ctx, bs.storeState)
 	go sw.run(bs.closeCh, bs.wg)
@@ -283,6 +287,7 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	workers.regionWorker.Start(runner.NewRegionTaskHandler(engines, ctx.snapMgr))
 	//新建GCWorker异步处理Compact时日志删除
 	workers.raftLogGCWorker.Start(runner.NewRaftLogGCTaskHandler())
+	//周期性处理如ChangePeer(addNode,removeNode)等需要确保完成的操作
 	workers.schedulerWorker.Start(runner.NewSchedulerTaskHandler(ctx.store.Id, ctx.schedulerClient, NewRaftstoreRouter(router)))
 	// 周期性发送tick消息
 	go bs.tickDriver.run()

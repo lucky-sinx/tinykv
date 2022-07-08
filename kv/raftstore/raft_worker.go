@@ -23,6 +23,7 @@ type raftWorker struct {
 }
 
 func newRaftWorker(ctx *GlobalContext, pm *router) *raftWorker {
+	//engine_util.DPrintf("new RaftWorker--router-%p", pm)
 	return &raftWorker{
 		raftCh: pm.peerSender,
 		ctx:    ctx,

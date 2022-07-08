@@ -261,6 +261,7 @@ func (m *MockSchedulerClient) RegionHeartbeat(req *schedulerpb.RegionHeartbeatRe
 	defer m.Unlock()
 
 	regionID := req.Region.GetId()
+	// 更新scheduler中pendingPeers的记录
 	for _, p := range req.Region.GetPeers() {
 		delete(m.pendingPeers, p.GetId())
 	}
@@ -284,13 +285,16 @@ func (m *MockSchedulerClient) RegionHeartbeat(req *schedulerpb.RegionHeartbeatRe
 	}
 	if op := m.operators[regionID]; op != nil {
 		if m.tryFinished(op, req.Region, req.Leader) {
+			// 操作已经执行完毕了，进行删除
 			delete(m.operators, regionID)
 		} else {
+			// 未执行完毕将命令放入response中
 			m.makeRegionHeartbeatResponse(op, resp)
 		}
 		log.Debugf("[region %d] schedule %v", regionID, op)
 	}
 
+	// 将response回复给Leader节点回调，回到scheduler_task中
 	store := m.stores[req.Leader.GetStoreId()]
 	store.heartbeatResponseHandler(resp)
 	return nil
@@ -390,12 +394,14 @@ func (m *MockSchedulerClient) handleHeartbeatConfVersion(region *metapb.Region) 
 	return nil
 }
 
+//判断add/remove/transfer命令是否已经执行完毕
 func (m *MockSchedulerClient) tryFinished(op *Operator, region *metapb.Region, leader *metapb.Peer) bool {
 	switch op.Type {
 	case OperatorTypeAddPeer:
 		add := op.Data.(*OpAddPeer)
 		if !add.pending {
 			for _, p := range region.GetPeers() {
+				// 如果在region中找到了要添加的节点并且还未准备执行该add命令，标记为pending
 				if add.peer.GetId() == p.GetId() {
 					add.pending = true
 					return false
@@ -404,6 +410,7 @@ func (m *MockSchedulerClient) tryFinished(op *Operator, region *metapb.Region, l
 			// TinyKV rejects AddNode.
 			return false
 		} else {
+			// 查看该节点是否还是pendingPeer
 			_, found := m.pendingPeers[add.peer.GetId()]
 			return !found
 		}

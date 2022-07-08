@@ -95,6 +95,7 @@ type peer struct {
 	peerCache map[uint64]*metapb.Peer
 	// Record the instants of peers being added into the configuration.
 	// Remove them after they are not pending any more.
+	// 记录一个peer第一次被标记为pendingPeer的时间
 	// (Used in 3B conf change)
 	PeersStartPendingTime map[uint64]time.Time
 	// Mark the peer as stopped, set when peer is destroyed
@@ -167,6 +168,7 @@ func (p *peer) removePeerCache(peerID uint64) {
 	delete(p.peerCache, peerID)
 }
 
+//查看有哪些peer在当前region中，包括还没有加入region但已经开始发送RaftMessage的peer
 func (p *peer) getPeerFromCache(peerID uint64) *metapb.Peer {
 	if peer, ok := p.peerCache[peerID]; ok {
 		return peer
@@ -205,6 +207,12 @@ func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 	// Set Tombstone state explicitly
 	kvWB := new(engine_util.WriteBatch)
 	raftWB := new(engine_util.WriteBatch)
+
+	//raftState, _ := meta.GetRaftLocalState(p.peerStorage.Engines.Raft, region.Id)
+	//applyState, _ := meta.GetApplyState(p.peerStorage.Engines.Kv, region.Id)
+	//engine_util.DPrintf("[before]regionId-%vv,raftEngine-%p,commitIndex-%v", region.Id, p.peerStorage.Engines.Raft, raftState.LastIndex)
+	//engine_util.DPrintf("[before]regionId-%v,kvEngine-%p,applyIndex-%v", region.Id, p.peerStorage.Engines.Kv, applyState.AppliedIndex)
+
 	if err := p.peerStorage.clearMeta(kvWB, raftWB); err != nil {
 		return err
 	}
@@ -216,6 +224,11 @@ func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 	if err := raftWB.WriteToDB(engine.Raft); err != nil {
 		return err
 	}
+
+	//raftState, _ = meta.GetRaftLocalState(p.peerStorage.Engines.Raft, region.Id)
+	//applyState, _ = meta.GetApplyState(p.peerStorage.Engines.Kv, region.Id)
+	//engine_util.DPrintf("[after]regionId-%v,raftEngine-%p,commitIndex-%v", region.Id, p.peerStorage.Engines.Raft, raftState.LastIndex)
+	//engine_util.DPrintf("[after]regionId-%v,kvEngine-%p,applyIndex-%v", region.Id, p.peerStorage.Engines.Kv, applyState)
 
 	if p.peerStorage.isInitialized() && !keepData {
 		// If we meet panic when deleting data and raft log, the dirty data
@@ -274,6 +287,8 @@ func (p *peer) Send(trans Transport, msgs []eraftpb.Message) {
 }
 
 /// Collects all pending peers and update `peers_start_pending_time`.
+// 收集所有pendingPeers并在PeersStartPendingTime中记录一个peer第一次被标记为pendingPeer的时间
+// pendingPeer是指存在于Leader节点的Prs中并且其MatchIndex < truncatedIdx，以及有相关消息记录（peerCache中存在）的节点
 func (p *peer) CollectPendingPeers() []*metapb.Peer {
 	pendingPeers := make([]*metapb.Peer, 0, len(p.Region().GetPeers()))
 	truncatedIdx := p.peerStorage.truncatedIndex()
@@ -342,6 +357,7 @@ func (p *peer) Term() uint64 {
 	return p.RaftGroup.Raft.Term
 }
 
+//向SchedulerTaskHandler发送任务,必须是Leader才能调用到这里
 func (p *peer) HeartbeatScheduler(ch chan<- worker.Task) {
 	clonedRegion := new(metapb.Region)
 	err := util.CloneMsg(p.Region(), clonedRegion)

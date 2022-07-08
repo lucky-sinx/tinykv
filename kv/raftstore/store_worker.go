@@ -35,7 +35,7 @@ type storeState struct {
 func newStoreState(cfg *config.Config) (chan<- message.Msg, *storeState) {
 	ch := make(chan message.Msg, 40960)
 	state := &storeState{
-		// 自己保存一个只读chan，传给RaftStore
+		// 自己保存一个只读chan，只写的传给RaftStore
 		receiver: (<-chan message.Msg)(ch),
 		ticker:   newStoreTicker(cfg),
 	}
@@ -107,6 +107,7 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 	fromStoreID := msg.FromPeer.StoreId
 
 	// Check if the target is tombstone,
+	// 构建statekey
 	stateKey := meta.RegionStateKey(regionID)
 	localState := new(rspb.RegionLocalState)
 	err := engine_util.GetMeta(d.ctx.engine.Kv, stateKey, localState)
@@ -116,8 +117,10 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 		}
 		return false, err
 	}
+	// 如果当前状态不为Tombstone
 	if localState.State != rspb.PeerState_Tombstone {
 		// Maybe split, but not registered yet.
+		// 如果是第一条请求投票的消息，或许正在分裂，等待
 		if util.IsFirstVoteMessage(msg.Message) {
 			meta := d.ctx.storeMeta
 			meta.RLock()
@@ -137,6 +140,7 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 	region := localState.Region
 	regionEpoch := region.RegionEpoch
 	// The region in this peer is already destroyed
+	// 发送者的RegionEpoch太旧了，让发送者删除自己
 	if util.IsEpochStale(fromEpoch, regionEpoch) {
 		log.Infof("tombstone peer receives a stale message. region_id:%d, from_region_epoch:%s, current_region_epoch:%s, msg_type:%s",
 			regionID, fromEpoch, regionEpoch, msgType)
@@ -153,6 +157,7 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 
 func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	regionID := msg.RegionId
+	//重试消息发送
 	if err := d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeRaftMessage, Data: msg}); err == nil {
 		return nil
 	}
@@ -187,6 +192,7 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	if !created {
 		return nil
 	}
+	//engine_util.DPrintf("d.ctx.router-%p", d.ctx.router)
 	_ = d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeRaftMessage, Data: msg})
 	return nil
 }
@@ -230,6 +236,8 @@ func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (b
 	meta.regions[regionID] = peer.Region()
 	d.ctx.router.register(peer)
 	_ = d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeStart})
+	// destroyPeer()时会删除，创建节点时需要重新加入
+	meta.regionRanges.ReplaceOrInsert(&regionItem{region: peer.Region()})
 	return true, nil
 }
 

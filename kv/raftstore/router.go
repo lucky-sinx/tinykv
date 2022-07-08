@@ -18,10 +18,13 @@ type peerState struct {
 }
 
 // router routes a message to a peer.
+// 放入Raftstore,snapRunner,GlobalContext.trans,GlobalContext.router,raftWorker.raftCh(peerSender)
 type router struct {
-	peers      sync.Map // regionID -> peerState
+	peers sync.Map // regionID -> peerState
+	// peerSender是newRouter时新建的，
 	peerSender chan message.Msg
 	// 只写chan，只读部分在storeState.receiver中
+	// storeState.receiver和router中的storeSender是同一个
 	storeSender chan<- message.Msg
 }
 

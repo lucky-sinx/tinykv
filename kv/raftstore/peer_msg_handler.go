@@ -46,6 +46,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
+	//engine_util.DPrintf("%v-HandleRaftReady-Router-%p", d.Meta.StoreId, d.ctx.router)
 	// Your Code Here (2B).
 	//1. 首先判断当前是否有Ready，有则更新信息，否则继续。
 	if d.RaftGroup.HasReady() {
@@ -58,6 +59,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		}
 		if applySnapResult != nil {
 			d.peerStorage.SetRegion(applySnapResult.Region)
+			// 修改storeMeta需要加锁，如maybeCreatePeer()中也修改了
 			d.ctx.storeMeta.Lock()
 			d.ctx.storeMeta.regions[d.Region().Id] = d.Region()
 			d.ctx.storeMeta.Unlock()
@@ -75,15 +77,20 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				kvWB := new(engine_util.WriteBatch)
 				if entry.EntryType == eraftpb.EntryType_EntryConfChange {
 					// confChange
+					d.configChange(&entry, kvWB)
 				} else {
 					d.process(&entry, kvWB)
-					d.peerStorage.applyState.AppliedIndex = entry.Index
-					err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-					if err != nil {
-						panic(err)
-					}
 				}
-				err := d.peerStorage.Engines.WriteKV(kvWB)
+				// Bug：removeNode后applyState已经清空，重新赋值会出问题
+				if d.stopped {
+					return
+				}
+				d.peerStorage.applyState.AppliedIndex = entry.Index
+				err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+				if err != nil {
+					panic(err)
+				}
+				err = d.peerStorage.Engines.WriteKV(kvWB)
 				if err != nil {
 					panic(err)
 				}
@@ -113,7 +120,7 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 			d.peerStorage.applyState.TruncatedState.Term = request.CompactLog.CompactTerm
 			//异步删除Log,实际删除log的操作在raftLogGcTaskHandle中做
 			d.ScheduleCompactLog(request.CompactLog.CompactIndex)
-			engine_util.DPrintf("storeID,RegionId[%v,%v] -- Apply[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
 		}
 		return
 	}
@@ -147,7 +154,7 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 				//So you should return this to let the client knows and retries the command again.
 				// Term不匹配
 				pro.cb.Done(ErrRespStaleCommand(entry.Term))
-				engine_util.DPrintf("storeID,RegionId[%v,%v] -- ErrStale[Normal]Command-TermUnMatch(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.regionId, pro.index, pro.term, entry.Index, entry.Term)
+				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ErrStale[Normal]Command-TermUnMatch(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, pro.index, pro.term, entry.Index, entry.Term)
 				d.proposals = d.proposals[1:]
 				if len(d.proposals) == 0 {
 					return
@@ -157,7 +164,7 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 			for ; pro.index < entry.Index && pro.term == entry.Term; pro = d.proposals[0] {
 				// index不匹配
 				pro.cb.Done(ErrResp(&util.ErrStaleCommand{}))
-				engine_util.DPrintf("storeID,RegionId[%v,%v] -- ErrStale[Normal]Command-IndexLittle(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.regionId, pro.index, pro.term, entry.Index, entry.Term)
+				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ErrStale[Normal]Command-IndexLittle(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, pro.index, pro.term, entry.Index, entry.Term)
 				d.proposals = d.proposals[1:]
 				if len(d.proposals) == 0 {
 					return
@@ -168,7 +175,7 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 				return
 			}
 
-			engine_util.DPrintf("storeID,RegionId[%v,%v] -- Apply[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, entry.Index, entry.Term, msg.Requests)
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, entry.Index, entry.Term, msg.Requests)
 
 			header := &raft_cmdpb.RaftResponseHeader{}
 			response := &raft_cmdpb.RaftCmdResponse{
@@ -209,6 +216,84 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 			d.proposals = d.proposals[1:]
 		}
 	}
+}
+
+// 判断peerId是否已经在Region中存在
+func (d *peerMsgHandler) checkInPeers(peerId uint64) bool {
+	for _, peer := range d.Region().GetPeers() {
+		if peer.Id == peerId {
+			return true
+		}
+	}
+	return false
+}
+
+// 修改config，addNode,removeNode
+func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) {
+	cc := new(eraftpb.ConfChange)
+	err := cc.Unmarshal(entry.Data)
+	if err != nil {
+		panic(err)
+	}
+	peerContext := new(metapb.Peer)
+	err = peerContext.Unmarshal(cc.Context)
+	if err != nil {
+		panic(err)
+	}
+	//修改Raft prs
+	d.RaftGroup.ApplyConfChange(*cc)
+	if cc.ChangeType == eraftpb.ConfChangeType_AddNode {
+		// 新增节点
+		if d.checkInPeers(peerContext.Id) {
+			return
+		}
+		// 修改该节点region中的peers
+		newPeer := &metapb.Peer{
+			Id:      peerContext.Id,
+			StoreId: peerContext.StoreId,
+		}
+		d.Region().Peers = append(d.Region().Peers, newPeer)
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- AddNode(stoneId,peerID)--[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id)
+
+		d.insertPeerCache(newPeer)
+	} else {
+		// 删除节点
+		if !d.checkInPeers(peerContext.Id) {
+			return
+		}
+		//删除自身
+		if peerContext.GetId() == d.PeerId() {
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- DestroyNode(stoneId,peerID)--[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id)
+			d.destroyPeer()
+			return
+		}
+
+		// 修改该节点region中的peers
+		index := -1
+		for i, peer := range d.Region().Peers {
+			if peer.GetId() == peerContext.GetId() {
+				index = i
+				break
+			}
+		}
+		if index == -1 {
+			return
+		}
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- RemoveNode(stoneId,peerID)--[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers[index].StoreId, d.Region().Peers[index].GetId())
+		d.Region().Peers = append(d.Region().Peers[:index], d.Region().Peers[index+1:]...)
+
+		d.removePeerCache(peerContext.GetId())
+	}
+	d.Region().RegionEpoch.ConfVer++
+
+	kvWB.SetMeta(meta.RegionStateKey(d.Region().Id), &rspb.RegionLocalState{
+		State:  rspb.PeerState_Normal,
+		Region: d.Region(),
+	})
+	// 修改元数据
+	d.ctx.storeMeta.Lock()
+	d.ctx.storeMeta.regions[d.Region().Id] = d.Region()
+	d.ctx.storeMeta.Unlock()
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -277,6 +362,7 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 
 // 对于RaftCmdRequest,进入HandleMsg之后，会调用proposeRaftCommand函数来进行Propose
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	//if d.stopped
 	// 只有Leader才能够进行写入，需要对其进行检查
 	// 对请求进行解析,恢复到原来的normal request or admin request
 	err := d.preProposeRaftCommand(msg)
@@ -287,16 +373,18 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	// Your Code Here (2B).
 	// Normal request
 	if msg.AdminRequest == nil {
+		// 对于外部请求，记录它所在的位置
 		// 后面分区时用
-		//util.CheckKeyInRegion()
+		//err := util.CheckKeyInRegion(msg.Requests[0])
 		// 使用Proposal来保留[index, term, callback]，callback通过channel便于在后面提交的时候进行process
 		d.proposals = append(d.proposals, &proposal{
 			index: d.nextProposalIndex(),
 			term:  d.Term(),
 			cb:    cb,
 		})
-		engine_util.DPrintf("storeID,RegionId[%v,%v] -- Propose[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.regionId, d.nextProposalIndex(), d.Term(), msg.Requests)
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Propose[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, d.nextProposalIndex(), d.Term(), msg.Requests)
 	} else {
+		// 处理AdminRequest，包括四种：CompactLog、TransferLeader、ChangePeer、Split
 		request := msg.AdminRequest
 		response := &raft_cmdpb.RaftCmdResponse{
 			Header: &raft_cmdpb.RaftResponseHeader{},
@@ -304,7 +392,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 
 		if request.CmdType == raft_cmdpb.AdminCmdType_CompactLog {
 			// compact
-			engine_util.DPrintf("storeID,RegionId[%v,%v] -- Propose[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Propose[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
 		} else if request.CmdType == raft_cmdpb.AdminCmdType_TransferLeader {
 			// Transfer Leader
 			d.RaftGroup.TransferLeader(request.TransferLeader.Peer.Id)
@@ -313,6 +401,28 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
 			}
 			cb.Done(response)
+			return
+		} else if request.CmdType == raft_cmdpb.AdminCmdType_ChangePeer {
+			// change config
+			peerContext, err := request.ChangePeer.Peer.Marshal()
+			if err != nil {
+				panic(err)
+			}
+			err = d.RaftGroup.ProposeConfChange(eraftpb.ConfChange{
+				ChangeType: request.ChangePeer.ChangeType,
+				NodeId:     request.ChangePeer.Peer.Id,
+				Context:    peerContext,
+			})
+			// callback这里应该没用，看schedule中都没有处理返回结果，反正是过段时间重新调用
+			if err != nil {
+				cb.Done(ErrResp(&util.ErrStaleCommand{}))
+			} else {
+				response.AdminResponse = &raft_cmdpb.AdminResponse{
+					CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+					TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+				}
+				cb.Done(response)
+			}
 			return
 		}
 	}
@@ -413,6 +523,7 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 		d.ctx.snapMgr.DeleteSnapshot(*key, s, false)
 		return nil
 	}
+	//记录从哪个节点发来了消息
 	d.insertPeerCache(msg.GetFromPeer())
 	// 继承自Peer,所以能直接点出来
 	err = d.RaftGroup.Step(*msg.GetMessage())
@@ -420,6 +531,7 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 		return err
 	}
 	if d.AnyNewPeerCatchUp(msg.FromPeer.Id) {
+		// 当新增节点追上了Leader的Log进度，尝试去删除scheduler_client中缓存的操作指令
 		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 	}
 	return nil
@@ -601,6 +713,7 @@ func (d *peerMsgHandler) destroyPeer() {
 		panic(fmt.Sprintf("%s destroy peer %v", d.Tag, err))
 	}
 	d.ctx.router.close(regionID)
+	//engine_util.DPrintf("destroy-d.ctx.router-%p", d.ctx.router)
 	d.stopped = true
 	if isInitialized && meta.regionRanges.Delete(&regionItem{region: d.Region()}) == nil {
 		panic(d.Tag + " meta corruption detected")

@@ -62,9 +62,11 @@ func (r *SchedulerTaskHandler) Handle(t worker.Task) {
 }
 
 func (r *SchedulerTaskHandler) Start() {
+	//设置SchedulerRegionHeartbeatTask这个任务在SchedulerClient 中的回调函数
 	r.SchedulerClient.SetRegionHeartbeatResponseHandler(r.storeID, r.onRegionHeartbeatResponse)
 }
 
+//HeartbeatTask处理完成后回调，向Leader发送AdminCmdType_ChangePeer以及AdminCmdType_TransferLeader消息
 func (r *SchedulerTaskHandler) onRegionHeartbeatResponse(resp *schedulerpb.RegionHeartbeatResponse) {
 	if changePeer := resp.GetChangePeer(); changePeer != nil {
 		r.sendAdminRequest(resp.RegionId, resp.RegionEpoch, resp.TargetPeer, &raft_cmdpb.AdminRequest{
@@ -114,6 +116,8 @@ func (r *SchedulerTaskHandler) onHeartbeat(t *SchedulerRegionHeartbeatTask) {
 		PendingPeers:    t.PendingPeers,
 		ApproximateSize: uint64(size),
 	}
+	// 向SchedulerClient发送RegionHeartbeat请求，触发它处理对应Region中未完成的任务，如addNode
+	// 在测试中使用的SchedulerClient是test_raftstore.scheduler
 	r.SchedulerClient.RegionHeartbeat(req)
 }
 

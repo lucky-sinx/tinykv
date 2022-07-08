@@ -9,3 +9,4 @@ _tools
 /kv/server/test*
 
 /kv/test_raftstore/test*
+/kv/test_raftstore/tmp.txt

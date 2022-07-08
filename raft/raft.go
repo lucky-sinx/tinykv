@@ -403,7 +403,7 @@ func (r *Raft) tick() {
 				To:      r.id,
 				From:    r.id,
 			})
-			DPrintf("[%v]--doHeartBeat--:begin to send HeartBeat-%v", r.id, r.Term)
+			DPrintf("[%v]--doHeartBeat--:begin to send HeartBeat-Term-%v", r.id, r.Term)
 		}
 		// transferee超时取消
 		//if r.leadTransferee != None {
@@ -494,6 +494,7 @@ func (r *Raft) appendEntry(entries ...*pb.Entry) {
 	var cnt uint64 = 0
 	for i := range entries {
 		//需要判断是否可以config change
+		//重复消息没有影响
 		if entries[i].EntryType == pb.EntryType_EntryConfChange {
 			if r.RaftLog.applied < r.PendingConfIndex {
 				continue
@@ -693,10 +694,11 @@ func (r *Raft) stepCandidate(m *pb.Message) error {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	if _, ok := r.Prs[r.id]; !ok {
-		DPrintf("[%v]--Step Fail--node not exist,term-%v", r.id, r.Term)
-		return nil
-	}
+	// 节点初次addNode创建无Prs，需要snapshot复制过来
+	//if _, ok := r.Prs[r.id]; !ok {
+	//	DPrintf("[%v]--Step Fail--node not exist,term-%v", r.id, r.Term)
+	//	return nil
+	//}
 	// 来了term大的，转follow
 	if m.Term > r.Term {
 		DPrintf("[%v]--RoleChange--:get Message more Term from Peer-%v--", r.id, m.From)
@@ -747,10 +749,13 @@ func (r *Raft) Step(m pb.Message) error {
 func (r *Raft) updateCommitIndexL() {
 	//Leader更新commitIndex
 	var tmp = make([]int, len(r.Prs))
-	for i, progress := range r.Prs {
-		tmp[i-1] = int(progress.Match)
+	// Prs的Key不一定连续
+	cnt := 0
+	for _, progress := range r.Prs {
+		tmp[cnt] = int(progress.Match)
+		cnt++
 	}
-	tmp[r.id-1] = int(r.RaftLog.LastIndex())
+	//tmp[r.id-1] = int(r.RaftLog.LastIndex())
 	sort.Ints(tmp)
 	nxtCommitMax := uint64(tmp[(len(r.Prs)-1)/2])
 
@@ -988,9 +993,10 @@ func (r *Raft) addNode(id uint64) {
 		return
 	}
 	if r.State == StateLeader {
+		// addNode的时候需要Next为0，促使其发送snapshot
 		r.Prs[id] = &Progress{
 			Match: 0,
-			Next:  r.RaftLog.LastIndex() + 1,
+			Next:  0,
 		}
 	} else {
 		r.Prs[id] = &Progress{}
@@ -1007,6 +1013,7 @@ func (r *Raft) removeNode(id uint64) {
 		return
 	}
 	if id == r.id {
+		DPrintf("[%v]--DestroyNode-%v Success--term-%v", r.id, id, r.Term)
 		r.Prs = make(map[uint64]*Progress, 0)
 		return
 	}
