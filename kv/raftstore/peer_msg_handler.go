@@ -48,8 +48,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// Your Code Here (2B).
 	if d.RaftGroup.HasReady() {
 		ready := d.RaftGroup.Ready()
-		log.Debugf("%v hasReady:%+v", d.Tag, ready)
-		log.Debugf("%v before handle Ready applyState=%+v,softState=%+v", d.Tag, d.peerStorage.applyState, d.peerStorage.raftState)
+		//log.Debugf("%v hasReady:%+v", d.Tag, ready)
+		//log.Debugf("%v before handle Ready applyState=%+v,softState=%+v", d.Tag, d.peerStorage.applyState, d.peerStorage.raftState)
 
 		// 持久化log、元数据到磁盘
 		applyResult, err := d.peerStorage.SaveReadyState(&ready)
@@ -76,7 +76,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			for _, entry := range ready.CommittedEntries {
 				d.applyEntry(&entry, kvWB)
 				if d.stopped {
-					// 可能apply了一条remove自己的命令，调用了destory(),直接返回，不用继续执行下面了
+					// 可能apply了一条remove自己的命令，调用了destory()会删除该region的元信息,直接返回，不用继续执行下面了
 					// 否则报错：
 					// panic: [region 1] 2 unexpected raft log index: lastIndex 0 < appliedIndex 8
 					return
@@ -88,7 +88,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		}
 		// 调用advance
 		d.RaftGroup.Advance(ready)
-		log.Debugf("%v after handle Ready applyState=%+v,softState=%+v", d.Tag, d.peerStorage.applyState, d.peerStorage.raftState)
+		//log.Debugf("%v after handle Ready applyState=%+v,softState=%+v", d.Tag, d.peerStorage.applyState, d.peerStorage.raftState)
 	} else {
 		//log.Debugf("%d-%v has not ready", d.RaftGroup.Raft.GetId(), d.RaftGroup.Raft.State)
 
@@ -166,57 +166,12 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
-
 	if msg.AdminRequest == nil {
-		proposal := &proposal{
-			term:  d.Term(),
-			index: d.nextProposalIndex(),
-			cb:    cb,
-		}
-		//添加新的proposal，每个proposal包含了callback
-		d.proposals = append(d.proposals, proposal)
-		//编码msg，调用rawNode.Propose写入raft
-		data, err := msg.Marshal()
-		if err != nil {
-			panic(err)
-		}
-		d.RaftGroup.Propose(data)
+		// 在cluster.NewBaseRequest中可以看到每一个request都会自动包括一个header，不要在这里设置header。
+		//msg.Header = &raft_cmdpb.RaftRequestHeader{RegionId: d.regionId, Peer: &metapb.Peer{Id: d.PeerId(), StoreId: d.storeID()}, RegionEpoch: d.Region().RegionEpoch}
+		d.proposeRequest(msg, cb)
 	} else {
-		switch msg.AdminRequest.CmdType {
-		case raft_cmdpb.AdminCmdType_CompactLog:
-			data, err := msg.Marshal()
-			if err != nil {
-				panic(err)
-			}
-			d.RaftGroup.Propose(data)
-		case raft_cmdpb.AdminCmdType_TransferLeader:
-			// no need to replicate to other peers, just need to call the TransferLeader()
-			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
-			cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-			cb.Done(&raft_cmdpb.RaftCmdResponse{
-				Header: &raft_cmdpb.RaftResponseHeader{},
-				AdminResponse: &raft_cmdpb.AdminResponse{
-					CmdType: raft_cmdpb.AdminCmdType_TransferLeader,
-					ChangePeer: &raft_cmdpb.ChangePeerResponse{
-						Region: d.Region(),
-					},
-				},
-			})
-		case raft_cmdpb.AdminCmdType_ChangePeer:
-			// 通过 ProposeConfChange 提出 conf change admin 命令
-			data, _ := msg.AdminRequest.ChangePeer.Marshal()
-			proposal := &proposal{
-				term:  d.Term(),
-				index: d.nextProposalIndex(),
-				cb:    cb,
-			}
-			d.proposals = append(d.proposals, proposal)
-			d.RaftGroup.ProposeConfChange(eraftpb.ConfChange{
-				ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
-				NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,
-				Context:    data,
-			})
-		}
+		d.proposeAdminRequest(msg, cb)
 	}
 }
 
@@ -658,15 +613,42 @@ func (d *peerMsgHandler) onGCSnap(snaps []snap.SnapKeyWithSending) {
 
 func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.WriteBatch) {
 	//writeBatch := &engine_util.WriteBatch{}
+	var msg = &raft_cmdpb.RaftCmdRequest{}
+	var header = &raft_cmdpb.RaftResponseHeader{}
+	var responses = make([]*raft_cmdpb.Response, 0) //d.commitNormalRequests(msg)
+	msg.Unmarshal(e.Data)
 	switch e.EntryType {
 	case eraftpb.EntryType_EntryNormal:
-		var msg = &raft_cmdpb.RaftCmdRequest{}
-		var header = &raft_cmdpb.RaftResponseHeader{}
-		var responses = make([]*raft_cmdpb.Response, 0) //d.commitNormalRequests(msg)
-
-		msg.Unmarshal(e.Data)
-
+		// apply前检查regionEpoch
+		if err := util.CheckRegionEpoch(msg, d.Region(), true); err != nil {
+			//log.Debugf("%v response err %v for msg %v", d.Tag, err, msg)
+			//log.Infof("%v response err %v for msg %v", d.Tag, err, msg)
+			//d.handleResponse(e, ErrResp(err))
+			d.handleResponse(e, ErrResp(&util.ErrEpochNotMatch{}))
+			return
+		}
 		if len(msg.Requests) > 0 {
+			// 先判断所有请求的key是否都在region里面
+			region := d.Region()
+			for _, request := range msg.Requests {
+				var key []byte
+				switch request.CmdType {
+				case raft_cmdpb.CmdType_Get:
+					key = request.Get.Key
+				case raft_cmdpb.CmdType_Put:
+					key = request.Put.Key
+				case raft_cmdpb.CmdType_Delete:
+					key = request.Delete.Key
+				case raft_cmdpb.CmdType_Snap:
+					// 没有key，无需进行下面的检查，否则scan命令总是返回错误导致request timeout
+					continue
+				}
+				if err := util.CheckKeyInRegion(key, region); err != nil {
+					d.handleResponse(e, ErrResp(err))
+					return
+				}
+			}
+
 			for _, request := range msg.Requests {
 				switch request.CmdType {
 				case raft_cmdpb.CmdType_Get:
@@ -695,12 +677,24 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 					})
 
 				case raft_cmdpb.CmdType_Snap:
+					//log.Infof("%v snap key=%v,value=%v", d.Tag, string(request.Put.Key), string(request.Put.Value))
 					writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 					writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+
+					region := &metapb.Region{
+						Id:       d.Region().Id,
+						StartKey: d.Region().StartKey,
+						EndKey:   d.Region().EndKey,
+						RegionEpoch: &metapb.RegionEpoch{
+							ConfVer: d.Region().RegionEpoch.GetConfVer(),
+							Version: d.Region().RegionEpoch.GetVersion(),
+						},
+						Peers: d.Region().Peers,
+					}
 					responses = append(responses, &raft_cmdpb.Response{
 						CmdType: raft_cmdpb.CmdType_Snap,
 						Snap: &raft_cmdpb.SnapResponse{
-							Region: d.Region(),
+							Region: region,
 						},
 					})
 
@@ -717,21 +711,77 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 					writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 					d.ScheduleCompactLog(index) //启动一个异步任务进行磁盘上的日志删除工作
 				}
+			case raft_cmdpb.AdminCmdType_Split:
+				//1.先比较splitKey与当前region的endKey
+				region := d.Region()
+
+				exceedEndKey := engine_util.ExceedEndKey(msg.AdminRequest.Split.SplitKey, region.EndKey)
+				if exceedEndKey {
+					// splitKey不在当前region中
+
+				} else {
+					// 将Region 分裂成两个 Region 时，其中一个 Region 将继承分裂前的元数据，
+					//1.修改其 Range 和 RegionEpoch，而另一个将创建相关的元信息。
+					region.RegionEpoch.Version++
+
+					newPeers := make([]*metapb.Peer, 0)
+					//构建storeId->到newPeerIDs的映射,主要是按照当前storeID在旧region中的次序来分配新的peerId
+					for i := range region.Peers {
+						newPeers = append(newPeers, &metapb.Peer{Id: msg.AdminRequest.Split.NewPeerIds[i], StoreId: region.Peers[i].StoreId})
+					}
+					newRegion := &metapb.Region{
+						Id:       msg.AdminRequest.Split.NewRegionId,
+						StartKey: msg.AdminRequest.Split.SplitKey,
+						EndKey:   region.EndKey,
+						RegionEpoch: &metapb.RegionEpoch{
+							ConfVer: region.RegionEpoch.GetConfVer(),
+							Version: region.RegionEpoch.GetVersion(),
+						},
+						Peers: newPeers,
+					}
+
+					//2.创建新的region：新创建的 Region 的对应 Peer 应该由 createPeer() 创建，并注册到 router.regions。
+					p, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.peerStorage.Engines, newRegion)
+					if err != nil {
+
+					}
+					d.ctx.router.register(p)
+					d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
+
+					//3.修改regionRanges，region 的信息应该插入 ctx.StoreMeta 中的regionRanges 中
+					d.ctx.storeMeta.Lock()
+					region.EndKey = msg.AdminRequest.Split.SplitKey
+					d.ctx.storeMeta.regions[region.GetId()] = region
+					d.ctx.storeMeta.regions[newRegion.GetId()] = newRegion
+					d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
+					d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+					d.ctx.storeMeta.Unlock()
+					//log.Infof("%v split new left region=%v,right region=%v", d.Tag, region, newRegion)
+					log.Debugf("%v split new left region=%v,right region=%v", d.Tag, region, newRegion)
+
+					//4.持久化region
+					meta.WriteRegionState(writeBatch, region, rspb.PeerState_Normal)
+					meta.WriteRegionState(writeBatch, newRegion, rspb.PeerState_Normal)
+
+				}
 			}
+
 		}
-
-		writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
-		writeBatch.Reset()
-		d.handleResponse(e, &raft_cmdpb.RaftCmdResponse{Header: header, Responses: responses})
 	case eraftpb.EntryType_EntryConfChange:
-
 		// conf change
 		cc := &eraftpb.ConfChange{}
-		cc.Unmarshal(e.Data)
-		var context raft_cmdpb.ChangePeerRequest
-		context.Unmarshal(cc.Context)
-		// 1、修改storage中的region信息并作持久化
 		region := d.Region()
+		msg := &raft_cmdpb.RaftCmdRequest{}
+
+		cc.Unmarshal(e.Data)
+		msg.Unmarshal(cc.Context)
+		//检查regionEpoch信息
+		if err := util.CheckRegionEpoch(msg, region, true); err != nil {
+			d.handleResponse(e, ErrResp(err))
+			return
+		}
+
+		// 1、修改storage中的region信息并作持久化
 		switch cc.ChangeType {
 		case eraftpb.ConfChangeType_AddNode:
 			for _, p := range region.Peers {
@@ -741,8 +791,8 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 				}
 			}
 			// 添加新的peer
-			region.Peers = append(region.Peers, context.Peer)
-			d.insertPeerCache(context.Peer) // peerCache用户获取该peer的storeId
+			region.Peers = append(region.Peers, msg.AdminRequest.ChangePeer.Peer)
+			d.insertPeerCache(msg.AdminRequest.ChangePeer.Peer) // peerCache用户获取该peer的storeId
 		case eraftpb.ConfChangeType_RemoveNode:
 			if cc.NodeId == d.peer.PeerId() {
 				// 销毁自己
@@ -774,8 +824,11 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 
 		// 3、修改raft中的Prs信息
 		d.RaftGroup.ApplyConfChange(*cc)
-
 	}
+
+	writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+	writeBatch.Reset()
+	d.handleResponse(e, &raft_cmdpb.RaftCmdResponse{Header: header, Responses: responses})
 }
 
 func (d *peerMsgHandler) handleResponse(e *eraftpb.Entry, r *raft_cmdpb.RaftCmdResponse) {
@@ -786,11 +839,15 @@ func (d *peerMsgHandler) handleResponse(e *eraftpb.Entry, r *raft_cmdpb.RaftCmdR
 		pterm, pindex := p.term, p.index
 		if pterm < eterm {
 			//stale proposal
+			log.Debugf("%v response proposal %v with response %v", d.Tag, p, ErrRespStaleCommand(pterm))
+			//log.Infof("%v response proposal %v with response %v", d.Tag, p, ErrRespStaleCommand(pterm))
 			p.cb.Done(ErrRespStaleCommand(pterm))
 			d.proposals = d.proposals[1:]
 		} else if pterm == eterm {
 			if pindex < eindex {
 				//stale proposal
+				log.Debugf("%v response proposal %v with response %v", d.Tag, p, ErrRespStaleCommand(pterm))
+				//log.Infof("%v response proposal %v with response %v", d.Tag, p, ErrRespStaleCommand(pterm))
 				p.cb.Done(ErrRespStaleCommand(pterm))
 				d.proposals = d.proposals[1:]
 			} else if pindex == eindex {
@@ -798,6 +855,8 @@ func (d *peerMsgHandler) handleResponse(e *eraftpb.Entry, r *raft_cmdpb.RaftCmdR
 				if len(r.Responses) > 0 && r.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
 					p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 				}
+				log.Debugf("%v response proposal %v with response %v", d.Tag, p, r)
+				//log.Infof("%v response proposal %v with response %v", d.Tag, p, r)
 				p.cb.Done(r)
 				d.proposals = d.proposals[1:]
 				return
@@ -808,26 +867,108 @@ func (d *peerMsgHandler) handleResponse(e *eraftpb.Entry, r *raft_cmdpb.RaftCmdR
 			return
 		}
 	}
+}
 
-	//var i int
-	//for i = 0; i < len(d.proposals); i++ {
-	//	if d.proposals[i].index == index {
-	//		break
-	//	}
+func (d *peerMsgHandler) proposeRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	region := d.Region()
+	for _, request := range msg.Requests {
+		var key []byte
+		switch request.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			key = request.Get.Key
+		case raft_cmdpb.CmdType_Put:
+			key = request.Put.Key
+		case raft_cmdpb.CmdType_Delete:
+			key = request.Delete.Key
+		case raft_cmdpb.CmdType_Snap:
+			// 没有key，无需进行下面的检查，否则scan命令总是返回错误导致request timeout
+			continue
+		}
+		if err := util.CheckKeyInRegion(key, region); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+	}
+	proposal := &proposal{
+		term:  d.Term(),
+		index: d.nextProposalIndex(),
+		cb:    cb,
+	}
+	//添加新的proposal，每个proposal包含了callback
+	d.proposals = append(d.proposals, proposal)
+	//编码msg，调用rawNode.Propose写入raft
+	log.Debugf("%v propose a Request: %v, proposal=%v", d.Tag, msg.Requests, proposal)
+	//log.Infof("%v propose a Request: %v, proposal=%v", d.Tag, msg, proposal)
+	//log.Infof("%v propose a Request: %v, proposal=%v", d.Tag, msg, proposal)
+	//if msg.Requests[0].CmdType == raft_cmdpb.CmdType_Snap {
+	//	log.Debugf("%v propose a Request: %v, proposal=%v,snapARgs=%v", d.Tag, msg, proposal, msg.Requests[0].Snap.XXX_unrecognized)
 	//}
-	//if i >= len(d.proposals) {
-	//	return
-	//}
-	//if len(r.Responses) > 0 && r.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
-	//	d.proposals[i].cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-	//}
-	//// proposal.Done()
-	//if d.proposals[i].term != term {
-	//	NotifyStaleReq(term, d.proposals[i].cb)
-	//	return
-	//}
-	//d.proposals[i].cb.Done(r)
-	//d.proposals = d.proposals[i+1:]
+	data, err := msg.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	d.RaftGroup.Propose(data)
+}
+
+func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	region := d.Region()
+	switch msg.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		data, err := msg.Marshal()
+		if err != nil {
+			panic(err)
+		}
+		//log.Infof("%v propose a Request: %v", d.Tag, msg)
+		d.RaftGroup.Propose(data)
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+		// no need to replicate to other peers, just need to call the TransferLeader()
+		d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+		cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+		cb.Done(&raft_cmdpb.RaftCmdResponse{
+			Header: &raft_cmdpb.RaftResponseHeader{},
+			AdminResponse: &raft_cmdpb.AdminResponse{
+				CmdType: raft_cmdpb.AdminCmdType_TransferLeader,
+				ChangePeer: &raft_cmdpb.ChangePeerResponse{
+					Region: d.Region(),
+				},
+			},
+		})
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		// 通过 ProposeConfChange 提出 conf change admin 命令
+		data, _ := msg.Marshal()
+		proposal := &proposal{
+			term:  d.Term(),
+			index: d.nextProposalIndex(),
+			cb:    cb,
+		}
+		d.proposals = append(d.proposals, proposal)
+		d.RaftGroup.ProposeConfChange(eraftpb.ConfChange{
+			ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
+			NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,
+			Context:    data,
+		})
+		log.Debugf("%v propose a change peer Request: %v, proposal=%v", d.Tag, msg.AdminRequest.ChangePeer, proposal)
+		//log.Infof("%v propose a change peer Request: %v, proposal=%v", d.Tag, msg.AdminRequest.ChangePeer, proposal)
+
+	case raft_cmdpb.AdminCmdType_Split:
+		// 1.判断splitKey和regionEpoch是否正确
+		if err := util.CheckKeyInRegion(msg.AdminRequest.Split.SplitKey, region); err != nil {
+			cb.Done(ErrResp(err))
+		}
+		if err := util.CheckRegionEpoch(msg, region, true); err != nil {
+			cb.Done(ErrResp(err))
+		}
+		data, _ := msg.Marshal()
+		proposal := &proposal{
+			term:  d.Term(),
+			index: d.nextProposalIndex(),
+			cb:    cb,
+		}
+		d.proposals = append(d.proposals, proposal)
+		d.RaftGroup.Propose(data)
+		log.Debugf("%v propose a split Request: %v, proposal=%v", d.Tag, msg.AdminRequest.Split, proposal)
+		//log.Infof("%v propose a split Request: %v, proposal=%v", d.Tag, msg.AdminRequest.Split, proposal)
+	}
 }
 
 func newAdminRequest(regionID uint64, peer *metapb.Peer) *raft_cmdpb.RaftCmdRequest {

@@ -185,6 +185,7 @@ func (c *Cluster) Request(key []byte, reqs []*raft_cmdpb.Request, timeout time.D
 	startTime := time.Now()
 	for i := 0; i < 10 || time.Since(startTime) < timeout; i++ {
 		region := c.GetRegion(key)
+		//log.Infof("%v get region:%v-------reqs:%v", string(key), region, reqs)
 		regionID := region.GetId()
 		req := NewRequest(regionID, region.RegionEpoch, reqs)
 		resp, txn := c.CallCommandOnLeader(&req, timeout)
@@ -361,7 +362,12 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 	values := make([][]byte, 0)
 	key := start
 	for (len(end) != 0 && bytes.Compare(key, end) < 0) || (len(key) == 0 && len(end) == 0) {
+		// 扫描每个region，完成后将key设置为region.EndKey扫描下一个region直到key>end或者为""结束
+
+		//req.Snap.XXX_unrecognized = key
 		resp, txn := c.Request(key, []*raft_cmdpb.Request{req}, 5*time.Second)
+		//log.Infof("%v get response %v, key=%v, begin---", req, key, resp)
+
 		if resp.Header.Error != nil {
 			panic(resp.Header.Error)
 		}
@@ -384,6 +390,7 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 			values = append(values, value)
 		}
 		iter.Close()
+		//log.Infof("%v get response %v,key=%v,end---", req, key, resp)
 
 		key = region.EndKey
 		if len(key) == 0 {
