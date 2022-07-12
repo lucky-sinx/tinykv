@@ -934,7 +934,18 @@ func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb 
 			},
 		})
 	case raft_cmdpb.AdminCmdType_ChangePeer:
-		// 通过 ProposeConfChange 提出 conf change admin 命令
+		// 通过 ProposeConfChange 提出 conf change admin
+		if msg.AdminRequest.ChangePeer.ChangeType == eraftpb.ConfChangeType_RemoveNode &&
+			len(d.Region().Peers) == 2 && d.IsLeader() && msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() {
+			//corner case：只剩两个节点的时候删除自身
+			//log.Infof("Corner case: will transfer:%v want propose a change peer Request: %v, peers=%v", d.Tag, msg.AdminRequest.ChangePeer, d.Region().Peers)
+			if d.Region().Peers[0].Id == d.PeerId() {
+				d.RaftGroup.TransferLeader(d.Region().Peers[1].Id)
+			} else {
+				d.RaftGroup.TransferLeader(d.Region().Peers[0].Id)
+			}
+			return
+		}
 		data, _ := msg.Marshal()
 		proposal := &proposal{
 			term:  d.Term(),
@@ -947,8 +958,8 @@ func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb 
 			NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,
 			Context:    data,
 		})
-		log.Debugf("%v propose a change peer Request: %v, proposal=%v", d.Tag, msg.AdminRequest.ChangePeer, proposal)
-		//log.Infof("%v propose a change peer Request: %v, proposal=%v", d.Tag, msg.AdminRequest.ChangePeer, proposal)
+		//log.Debugf("%v propose a change peer Request: %v, proposal=%v", d.Tag, msg.AdminRequest.ChangePeer, proposal)
+		log.Infof("%v propose a change peer Request: %v, proposal=%v, peers=%v", d.Tag, msg.AdminRequest.ChangePeer, proposal, d.Region().Peers)
 
 	case raft_cmdpb.AdminCmdType_Split:
 		// 1.判断splitKey和regionEpoch是否正确

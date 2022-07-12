@@ -259,6 +259,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 			}
 			panic(err)
 		}
+		r.logger.Infof("%x send snapshot to %x", r.id, to)
 		m.Snapshot = &snapshot
 		r.Prs[to].Next = snapshot.Metadata.Index + 1
 	} else {
@@ -274,6 +275,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		}
 		m.Entries = entries
 		m.Commit = r.RaftLog.committed
+		//log.Infof("%x send append msg to %d , nextIndex=%v", r.id, to, nextIndex)
 	}
 	r.send(m)
 	return false
@@ -330,7 +332,8 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.State = StateLeader
 	// NOTE: Leader should propose a noop entry on its term
-	log.Debugf("%x become leader at term %+v", r.id, r.Term)
+	//log.Debugf("%x become leader at term %+v", r.id, r.Term)
+	//log.Infof("%x become leader at term %+v", r.id, r.Term)
 
 	r.appendEntry(&pb.Entry{Data: nil})
 }
@@ -431,9 +434,10 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	} else {
 		// Reply false if log doesn’t contain an entry at prevLogIndex
 		// whose term matches prevLogTerm (§5.3)
-		response.Index = m.Index
+		response.Index = r.RaftLog.LastIndex()
 		response.Reject = true
 	}
+	//log.Infof("%d response append entries to %d with %v", r.id, m.From, response)
 	r.send(response)
 }
 
@@ -479,7 +483,8 @@ func (r *Raft) addNode(id uint64) {
 		return
 	}
 	r.Prs[id] = &Progress{
-		Next:  r.RaftLog.LastIndex(),
+		// 设置为0可以在下次心跳时快速给新节点发送快照
+		Next:  0,
 		Match: 0,
 	}
 }
@@ -721,7 +726,8 @@ func (r *Raft) broadCastAppend() {
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	if m.Reject {
 		//append失败了，尝试回退nextIndex后重新发送
-		r.Prs[m.From].Next = max(1, r.Prs[m.From].Next-1)
+		//m.index是follower的lastIndex，若nextIndex-1>m.index+1,可以直接更新到这里
+		r.Prs[m.From].Next = max(1, min(m.Index+1, r.Prs[m.From].Next-1))
 		r.sendAppend(m.From)
 	} else {
 		//更新该节点的next、match
