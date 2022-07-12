@@ -110,6 +110,10 @@ type peer struct {
 	// It's updated everytime the split checker scan the data
 	// (Used in 3B split)
 	ApproximateSize *uint64
+
+	// 当只有两节点要删除Leader时，记录Follow重新尝试删除Leader的次数，为什么这样见configChange，主要是两军问题，无法保证两节点同时知道要删除其中一个节点
+	// 既然无解，后来改成更好控制的记录Transfer次数，到达一定次数删除Leader
+	//WantDeleteLeaderTimes uint64
 }
 
 func NewPeer(storeId uint64, cfg *config.Config, engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task,

@@ -282,6 +282,8 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	}
 	engines := ctx.engine
 	cfg := ctx.cfg
+	//RaftWoker会定时向SplitCheckWoker发送SplitCheckTask消息判断Region大小是否超过了阈值。
+	//如果超过了Region指定的大小，返回一个切割Key。如果没有超过大小则返回一个调整Region Size大小的消息。
 	workers.splitCheckWorker.Start(runner.NewSplitCheckHandler(engines.Kv, NewRaftstoreRouter(router), cfg))
 	//处理如storage.snapshot发过来的RegionTaskGen任务
 	workers.regionWorker.Start(runner.NewRegionTaskHandler(engines, ctx.snapMgr))

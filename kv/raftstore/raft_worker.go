@@ -54,7 +54,10 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 		for _, msg := range msgs {
 			peerState := rw.getPeerState(peerStateMap, msg.RegionID)
 			if peerState == nil {
+				//engine_util.DPrintf("peerId[nullPeerState]--getMsg-%v", msg)
 				continue
+			} else {
+				//engine_util.DPrintf("peerId[%v]--getMsg-%v", peerState.peer.PeerId(), msg)
 			}
 			// 处理消息的Propose
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg)

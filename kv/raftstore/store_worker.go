@@ -107,7 +107,7 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 	fromStoreID := msg.FromPeer.StoreId
 
 	// Check if the target is tombstone,
-	// 构建statekey
+	// 构建RegionStateKey
 	stateKey := meta.RegionStateKey(regionID)
 	localState := new(rspb.RegionLocalState)
 	err := engine_util.GetMeta(d.ctx.engine.Kv, stateKey, localState)

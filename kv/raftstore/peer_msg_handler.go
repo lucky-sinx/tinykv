@@ -58,7 +58,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			panic(err)
 		}
 		if applySnapResult != nil {
-			d.peerStorage.SetRegion(applySnapResult.Region)
 			// 修改storeMeta需要加锁，如maybeCreatePeer()中也修改了
 			d.ctx.storeMeta.Lock()
 			d.ctx.storeMeta.regions[d.Region().Id] = d.Region()
@@ -73,14 +72,45 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			d.Send(d.ctx.trans, rd.Messages)
 		}
 		if len(rd.CommittedEntries) != 0 {
-			for _, entry := range rd.CommittedEntries {
+			// 成功apply的entry
+			successCommitEntries := make([]eraftpb.Entry, 0)
+			for i, entry := range rd.CommittedEntries {
 				kvWB := new(engine_util.WriteBatch)
 				if entry.EntryType == eraftpb.EntryType_EntryConfChange {
 					// confChange
 					d.configChange(&entry, kvWB)
+					//if configChangeState != 1 {
+					//	// 两节点，是Leader并且是RemoveNode自身的Log，则不提交该Log及之后的Log
+					//	// Transfer Leader
+					//	if d.IsLeader() && configChangeState == 2 {
+					//		var toId uint64 = d.PeerId()
+					//		for _, peer := range d.Region().Peers {
+					//			if peer.Id != d.PeerId() {
+					//				toId = peer.Id
+					//				break
+					//			}
+					//		}
+					//		if toId == d.PeerId() {
+					//			panic("check the two peers transfer Leader")
+					//		}
+					//		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- TransferBeforeDestroy to-%v", d.Meta.StoreId, d.PeerId(), d.regionId, toId)
+					//
+					//		d.RaftGroup.TransferLeader(toId)
+					//
+					//	}
+					//	break
+					//}
+					//else if configChangeState == 3 {
+					//	// 两节点，是Follow并且是RemoveNode Leader的Log，则不提交该Log及之后的Log
+					//	// 等待Leader Transfer成功，自身成为Leader
+					//	break
+					//}
 				} else {
 					d.process(&entry, kvWB)
 				}
+
+				successCommitEntries = append(successCommitEntries, rd.CommittedEntries[i])
+
 				// Bug：removeNode后applyState已经清空，重新赋值会出问题
 				if d.stopped {
 					return
@@ -94,6 +124,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				if err != nil {
 					panic(err)
 				}
+			}
+			rd.CommittedEntries = successCommitEntries
+			commitIndex := len(rd.CommittedEntries) - 1
+			if commitIndex >= 0 {
+				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ApplyIndex-%v,lastApplyEntry-%v", d.Meta.StoreId, d.PeerId(), d.regionId, rd.CommittedEntries[commitIndex].Index, rd.CommittedEntries[commitIndex])
 			}
 		}
 
@@ -206,9 +241,21 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 				}}
 			case raft_cmdpb.CmdType_Snap:
 				// 后面好像region可能会发生改变
+				//d.Region是一个指针，后面可能修改它的值，所以应该重新new一个Region复制过去
+
+				responseRegion := new(metapb.Region)
+				data, err := d.Region().Marshal()
+				if err != nil {
+					panic(err)
+				}
+				err = responseRegion.Unmarshal(data)
+				if err != nil {
+					panic(err)
+				}
+
 				response.Responses = []*raft_cmdpb.Response{{
 					CmdType: raft_cmdpb.CmdType_Snap,
-					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+					Snap:    &raft_cmdpb.SnapResponse{Region: responseRegion},
 				}}
 				pro.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 			}
@@ -229,7 +276,8 @@ func (d *peerMsgHandler) checkInPeers(peerId uint64) bool {
 }
 
 // 修改config，addNode,removeNode
-func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) {
+// 三种返回值，成功configChange返回1，两节点Leader删除自身失败需要transfer返回2，两节点Follow删除Leader失败需要等到Leader Transfer成功返回3
+func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) int {
 	cc := new(eraftpb.ConfChange)
 	err := cc.Unmarshal(entry.Data)
 	if err != nil {
@@ -240,12 +288,11 @@ func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.Wr
 	if err != nil {
 		panic(err)
 	}
-	//修改Raft prs
-	d.RaftGroup.ApplyConfChange(*cc)
+
 	if cc.ChangeType == eraftpb.ConfChangeType_AddNode {
 		// 新增节点
 		if d.checkInPeers(peerContext.Id) {
-			return
+			return 1
 		}
 		// 修改该节点region中的peers
 		newPeer := &metapb.Peer{
@@ -253,20 +300,64 @@ func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.Wr
 			StoreId: peerContext.StoreId,
 		}
 		d.Region().Peers = append(d.Region().Peers, newPeer)
-		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- AddNode(stoneId,peerID)--[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id)
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- AddNode(stoneId,peerID)--[%v,%v],confver-%v", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id, d.Region().RegionEpoch.ConfVer)
 
 		d.insertPeerCache(newPeer)
 	} else {
 		// 删除节点
 		if !d.checkInPeers(peerContext.Id) {
-			return
+			return 1
 		}
+		// 无论是否是删除自身，在两节点的情况下都需要延时删除，保证两节点都删了其中一个
+		// 还是不行，改成propose前必须transfer了
+		//if len(d.Region().Peers) == 2 {
+		//	d.WantDeleteLeaderTimes++
+		//	if d.WantDeleteLeaderTimes <= 100 {
+		//		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v]--WantDeleteLeaderTimes-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.WantDeleteLeaderTimes)
+		//		//删除自身
+		//		if peerContext.GetId() == d.PeerId() {
+		//			return 2
+		//		} else {
+		//			return 3
+		//		}
+		//	}
+		//}
+		//d.WantDeleteLeaderTimes = 0
+
 		//删除自身
 		if peerContext.GetId() == d.PeerId() {
-			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- DestroyNode(stoneId,peerID)--[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id)
+			// 两个节点并且当前是Leader的时候，不能Apply remove自身，否则可能commitIndex没有同步出去
+			// 另一个节点超时选举时并不知道removeNode Log已经commit了，会向该节点请求Vote，
+			// 而当前节点不存在会导致一直请求失败，Leader选举不出来，集群不可用
+			//bug想法1:只增加这一个判断是不够的，因为当Follow Region正常删除Leader时，Leader还在Transfer没能删除自己
+			//这时Transfer相关的TimeOut消息会成为stale消息被Follow拒收，导致Leader一直在Transfer状态，集群不可用
+
+			//还有个问题，Follow需要更新commit，但因为它超时直接成了candidate，Term变得比Leader大了，这时candidate怎么也不可能更新commit，也就是remove node那条日志不会提交，leader的region一直删不掉，新leader也就选不出来
+			//最后还是弄简单点，Leader多Transfer几次再变更吧。。。。
+			//d.WantDeleteLeaderTimes++
+			// 后去除d.IsLeader()的判断，因为当Leader给Candidate的投票可能需要后面重发，不能直接删除
+			//if len(d.Region().Peers) == 2 && d.WantDeleteLeaderTimes <= 100 {
+			//	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v]--WantDeleteLeaderTimes-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.WantDeleteLeaderTimes)
+			//	return 2
+			//}
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- DestroyNode(stoneId,peerID)--[%v,%v],confVersion-%v", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id, d.Region().RegionEpoch.ConfVer)
 			d.destroyPeer()
-			return
+			return 1
 		}
+
+		// bug想法2：当集群只有两节点时，如果不是删除自身，必须等到自己是Leader，也就是说原Leader要Transfer成功了，才能删除
+		// bug想法3：但这样还是不够的，Flower向Leader请求Vote，Leader投票后就把自己删了，无法保证Flower成功成为Leader然后删除原Leader
+		// 因为两节点间的通信是不稳定的，没有办法完全保证他们同时知道要删除某个节点（两军问题），无解，只能设定一个次数，当Follow一直没能成为Leader，直接删除原Leader自己晋升为Leader
+		// 这里记录的是Follow 尝试commit的次数，但Follow不一定更新了commit，因此修改Timeout消息，这里的方法保证了Timeout一定成功接收
+		//if len(d.Region().Peers) == 2 && !d.IsLeader() {
+		//	d.WantDeleteLeaderTimes++
+		//	engine_util.DPrintf("WantDeleteLeaderTimes-%v", d.WantDeleteLeaderTimes)
+		//	// 试出来的值，理论上来说每次tick都会导致+1，但Candidate重新当选发送VoteRequest需要很多10-20个Tick
+		//	if d.WantDeleteLeaderTimes <= 5 {
+		//		return 3
+		//	}
+		//}
+		//d.WantDeleteLeaderTimes = 0
 
 		// 修改该节点region中的peers
 		index := -1
@@ -277,13 +368,16 @@ func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.Wr
 			}
 		}
 		if index == -1 {
-			return
+			return 1
 		}
-		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- RemoveNode(stoneId,peerID)--[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers[index].StoreId, d.Region().Peers[index].GetId())
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- RemoveNode(stoneId,peerID)--[%v,%v],confver-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers[index].StoreId, d.Region().Peers[index].GetId(), d.Region().RegionEpoch.ConfVer)
 		d.Region().Peers = append(d.Region().Peers[:index], d.Region().Peers[index+1:]...)
 
 		d.removePeerCache(peerContext.GetId())
 	}
+	//修改Raft prs
+	d.RaftGroup.ApplyConfChange(*cc)
+
 	d.Region().RegionEpoch.ConfVer++
 
 	kvWB.SetMeta(meta.RegionStateKey(d.Region().Id), &rspb.RegionLocalState{
@@ -294,6 +388,7 @@ func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.Wr
 	d.ctx.storeMeta.Lock()
 	d.ctx.storeMeta.regions[d.Region().Id] = d.Region()
 	d.ctx.storeMeta.Unlock()
+	return 1
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -404,10 +499,31 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			return
 		} else if request.CmdType == raft_cmdpb.AdminCmdType_ChangePeer {
 			// change config
+			// 玄学，在propose前transfer，TestConfChangeUnreliable3B怎么会有这么巧的网络导致我Follow可能超时成candidate更新不了commit，删除不了Leader集群不可用
+			// 但Follow不会重新当选Leader，等都等了100tick了都当选不了，导致在apply时等着transfer很可能出问题，但这里transfer就完美避免了。。。。。。
+			// 竟然还有极小概率出现问题：AppendEntry一直request失败导致超时。。。。吐血
+			if len(d.Region().Peers) == 2 && request.ChangePeer.ChangeType == eraftpb.ConfChangeType_RemoveNode && request.ChangePeer.Peer.Id == d.PeerId() && d.IsLeader() {
+				var toId uint64 = d.PeerId()
+				for _, peer := range d.Region().Peers {
+					if peer.Id != d.PeerId() {
+						toId = peer.Id
+						break
+					}
+				}
+				if toId == d.PeerId() {
+					panic("check the two peers transfer Leader")
+				}
+				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- TransferBeforeProposeDestroy to-%v", d.Meta.StoreId, d.PeerId(), d.regionId, toId)
+
+				d.RaftGroup.TransferLeader(toId)
+				return
+			}
+
 			peerContext, err := request.ChangePeer.Peer.Marshal()
 			if err != nil {
 				panic(err)
 			}
+
 			err = d.RaftGroup.ProposeConfChange(eraftpb.ConfChange{
 				ChangeType: request.ChangePeer.ChangeType,
 				NodeId:     request.ChangePeer.Peer.Id,
@@ -421,6 +537,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 					CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
 					TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
 				}
+				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Propose[ConfChange]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, d.RaftGroup.Raft.RaftLog.LastIndex(), d.Term(), request.ChangePeer)
 				cb.Done(response)
 			}
 			return
@@ -437,7 +554,10 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		// 前面给的代码中作了是否是Leader的校验，貌似不需要了
 		// ErrNotLeader: the raft command is proposed on a follower. so use it to let the client try other peers.
 		// BindRespError()
-		panic(err)
+		//panic(err)
+		// 后面修改：因有Transfer导致无法propose，需要报错重发
+		cb.Done(ErrResp(err))
+		return
 	}
 }
 
@@ -493,6 +613,7 @@ func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	log.Debugf("%s handle raft message %s from %d to %d",
 		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
+	// 验证消息，这里主要做了两个判断，一个时发送的目标StroeID是不是错误，一个时msg.RegionEpoch是否为nil
 	if !d.validateRaftMessage(msg) {
 		return nil
 	}
@@ -501,6 +622,7 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	}
 	if msg.GetIsTombstone() {
 		// we receive a message tells us to remove self.
+		// 如果发送者的RegionEpoch不落后，且消息的目的地确实为Peer，则将自己Destroy
 		d.handleGCPeerMsg(msg)
 		return nil
 	}
@@ -516,6 +638,7 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 		// delete them here. If the snapshot file will be reused when
 		// receiving, then it will fail to pass the check again, so
 		// missing snapshot files should not be noticed.
+		// 如果用过了则删除snapshot
 		s, err1 := d.ctx.snapMgr.GetSnapshotForApplying(*key)
 		if err1 != nil {
 			return err1
@@ -584,14 +707,17 @@ func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	region := d.Region()
 	if util.IsEpochStale(fromEpoch, region.RegionEpoch) && util.FindPeer(region, fromStoreID) == nil {
 		// The message is stale and not in current region.
+		// 发送一条让他删除自己的消息
 		handleStaleMsg(d.ctx.trans, msg, region.RegionEpoch, isVoteMsg)
 		return true
 	}
 	target := msg.GetToPeer()
 	if target.Id < d.PeerId() {
+		// 如果目标peer id比自身小证明这是旧消息，不处理
 		log.Infof("%s target peer ID %d is less than %d, msg maybe stale", d.Tag, target.Id, d.PeerId())
 		return true
 	} else if target.Id > d.PeerId() {
+		//如果目标的peer id比自身大证明自身时旧Region，删除自身
 		if d.MaybeDestroy() {
 			log.Infof("%s is stale as received a larger peer %s, destroying", d.Tag, target)
 			d.destroyPeer()
@@ -659,6 +785,7 @@ func (d *peerMsgHandler) checkSnapshot(msg *rspb.RaftMessage) (*snap.SnapKey, er
 	peerID := msg.ToPeer.Id
 	var contains bool
 	for _, peer := range snapRegion.Peers {
+		// 是否发错peer了
 		if peer.Id == peerID {
 			contains = true
 			break
@@ -671,6 +798,7 @@ func (d *peerMsgHandler) checkSnapshot(msg *rspb.RaftMessage) (*snap.SnapKey, er
 	meta := d.ctx.storeMeta
 	meta.Lock()
 	defer meta.Unlock()
+	// 如果meta中的region信息与d.Region信息不符，等待初始化
 	if !util.RegionEqual(meta.regions[d.regionId], d.Region()) {
 		if !d.isInitialized() {
 			log.Infof("%s stale delegate detected, skip", d.Tag)
@@ -680,11 +808,13 @@ func (d *peerMsgHandler) checkSnapshot(msg *rspb.RaftMessage) (*snap.SnapKey, er
 		}
 	}
 
+	// 如果和现有的region有交集
 	existRegions := meta.getOverlapRegions(snapRegion)
 	for _, existRegion := range existRegions {
 		if existRegion.GetId() == snapRegion.GetId() {
 			continue
 		}
+		// 可能是region分裂了，snapRegion中的id与存在的region id不同，返回key
 		log.Infof("%s region overlapped %s %s", d.Tag, existRegion, snapRegion)
 		return &key, nil
 	}
