@@ -16,8 +16,10 @@ package schedulers
 import (
 	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
+	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/filter"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/opt"
+	"sort"
 )
 
 func init() {
@@ -78,5 +80,71 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
 
+	// 1.首先，Scheduler 将选择所有合适的 store。然后根据它们的 region 大小进行排序。
+	stores := cluster.GetStores()
+	suitableStores := filter.SelectSourceStores(stores, []filter.Filter{filter.StoreStateFilter{ActionScope: s.GetName(), TransferLeader: true}}, cluster)
+	sort.Slice(suitableStores, func(i, j int) bool {
+		return suitableStores[i].GetRegionSize() > suitableStores[j].GetRegionSize()
+	})
+	// 2.遍历suitableStores寻找合适的可转移的region
+	var region *core.RegionInfo
+	var sourceStoreIndex, targetStoreIndex = -1, -1
+	for index, store := range suitableStores {
+		var callback = func(container core.RegionsContainer) {
+			// select a random region
+			region = container.RandomRegion(nil, nil)
+		}
+		//首先，它将尝试选择一个挂起的 region
+		cluster.GetPendingRegionsWithLock(store.GetID(), callback)
+		if region != nil {
+			sourceStoreIndex = index
+			break
+		}
+		//如果没有一个挂起的 region，它将尝试找到一个 Follower region。
+		cluster.GetFollowersWithLock(store.GetID(), callback)
+		if region != nil {
+			sourceStoreIndex = index
+			break
+		}
+		//如果没有一个挂起的 region，它将尝试找到一个 Follower region。
+		cluster.GetLeadersWithLock(store.GetID(), callback)
+		if region != nil {
+			sourceStoreIndex = index
+			break
+		}
+	}
+	if region == nil {
+		// 找不到合适的region
+		return nil
+	}
+	if len(region.GetStoreIds()) < cluster.GetMaxReplicas() {
+		return nil
+	}
+
+	// 3.寻找target store,regionSize最小的store
+	for i := len(suitableStores) - 1; i > sourceStoreIndex; i-- {
+		storeId := suitableStores[i].GetID()
+		_, ok := region.GetStoreIds()[storeId]
+		if !ok {
+			targetStoreIndex = i
+			break
+		}
+	}
+	if targetStoreIndex == -1 {
+		return nil
+	}
+	// 4.判断是否值得进行move操作
+	if suitableStores[sourceStoreIndex].GetRegionSize()-suitableStores[targetStoreIndex].GetRegionSize() >
+		2*region.GetApproximateSize() {
+		newPeer, err := cluster.AllocPeer(suitableStores[targetStoreIndex].GetID())
+		if err != nil {
+			return nil
+		}
+		peerOperator, err := operator.CreateMovePeerOperator("", cluster, region, operator.OpBalance, suitableStores[sourceStoreIndex].GetID(),
+			suitableStores[targetStoreIndex].GetID(), newPeer.GetId())
+		if err == nil {
+			return peerOperator
+		}
+	}
 	return nil
 }

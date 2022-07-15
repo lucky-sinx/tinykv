@@ -280,6 +280,36 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
 
+	// processRegionHeartbeat 函数的唯一参数是一个 regionInfo。它包含了关于这个心跳的发送者 region 的信息。
+	// Scheduler 需要做的仅仅是更新本地region 记录
+
+	// 1.Check whether there is a region with the same Id in local storage.
+	if region.GetRegionEpoch() == nil {
+		return errors.Errorf("region epoceh is nil")
+	}
+	origin, _ := c.GetRegionByID(region.GetID())
+	if origin != nil {
+		if origin.RegionEpoch.Version > region.GetRegionEpoch().Version ||
+			origin.RegionEpoch.ConfVer > region.GetRegionEpoch().ConfVer {
+			// If there is and at least one of the heartbeats’ conf_ver and version is less than its, this heartbeat region is stale
+			return ErrRegionIsStale(region.GetMeta(), origin)
+		}
+	} else {
+		// If there isn’t, scan all regions that overlap with it.
+		// The heartbeats’ conf_ver and version should be greater or equal than all of them,
+		// or the region is stale.
+		regions := c.ScanRegions(region.GetStartKey(), region.GetEndKey(), -1)
+		for _, regionInfo := range regions {
+			if regionInfo.GetRegionEpoch().Version > region.GetRegionEpoch().Version ||
+				regionInfo.GetRegionEpoch().ConfVer > region.GetRegionEpoch().ConfVer {
+				return ErrRegionIsStale(region.GetMeta(), regionInfo.GetMeta())
+			}
+		}
+	}
+	c.putRegion(region)
+	for id, _ := range region.GetStoreIds() {
+		c.updateStoreStatusLocked(id)
+	}
 	return nil
 }
 
