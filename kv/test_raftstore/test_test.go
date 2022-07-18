@@ -667,6 +667,10 @@ func TestOneSplit3B(t *testing.T) {
 
 	req := NewRequest(left.GetId(), left.GetRegionEpoch(), []*raft_cmdpb.Request{NewGetCfCmd(engine_util.CfDefault, []byte("k2"))})
 	resp, _ := cluster.CallCommandOnLeader(&req, time.Second)
+	// 存在暂时不可解决的错误：网络分区重新加入导致Leader选举，同时需要request
+	// 因为一段时间选不出新Leader导致超时，返回的resp为nil
+	// 后面有时间再去实现pre-vote吧
+	//engine_util.DPrintf("test-Getresponse-%v", resp)
 	assert.NotNil(t, resp.GetHeader().GetError())
 	assert.NotNil(t, resp.GetHeader().GetError().GetKeyNotInRegion())
 

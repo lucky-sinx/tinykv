@@ -345,15 +345,17 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	//删除所有stata和log
-	err := ps.clearMeta(kvWB, raftWB)
-	if err != nil {
-		panic(err)
-	}
-	//更新region
-	//删除非Region内的数据
-	ps.clearExtraData(snapData.Region)
 
+	if ps.isInitialized() {
+		//更新region
+		//删除old Region内非new Region的数据，如果是新增节点，old为无穷，会将所有数据都删除
+		ps.clearExtraData(snapData.Region)
+		//删除所有stata和log
+		err := ps.clearMeta(kvWB, raftWB)
+		if err != nil {
+			panic(err)
+		}
+	}
 	ps.raftState.LastIndex, ps.raftState.LastTerm = snapshot.Metadata.Index, snapshot.Metadata.Term
 	ps.raftState.HardState.Commit, ps.raftState.HardState.Term, ps.raftState.HardState.Vote = snapshot.Metadata.Index, snapshot.Metadata.Term, 0
 	raftWB.SetMeta(meta.RaftStateKey(snapData.Region.GetId()), ps.raftState)

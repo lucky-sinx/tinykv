@@ -215,6 +215,12 @@ func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (b
 		return false, nil
 	}
 
+	// 获取msg中的region是否与该store上某些region有重合
+	// 如果有split消息在region上apply了，如果当前store因为网络原因还没有apply，已经分裂出来
+	// 的节点会向一个还没创建的节点发心跳，此时因为原peer没有apply split，会有region重合，所以不创建节点
+	// 等待由原节点apply时分裂出来。
+	// 但如果原节点所在region compact了，split的消息被压缩，原节点会因snap改变region，而不会通过apply split创建
+	// 新节点，此时便没有了overlapRegion，会直接在这里被新建出来等待snap消息
 	for _, region := range meta.getOverlapRegions(&metapb.Region{
 		StartKey: msg.StartKey,
 		EndKey:   msg.EndKey,

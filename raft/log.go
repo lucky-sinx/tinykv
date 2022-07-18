@@ -16,6 +16,7 @@ package raft
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -161,14 +162,21 @@ func (l *RaftLog) sliceInAll(left, right uint64) ([]pb.Entry, error) {
 		tmpR = l.entries[0].Index - 1
 	}
 
+	// 比如entries为空，所有log都compact了left刚好等于truncIndex+1，此时不能去拿数据
+	// 实际上后来改成了所有没compact的Log都在内存中，这里没有用到
 	if len(l.entries) == 0 || left < l.entries[0].Index {
 		storedEnts, err := l.storage.Entries(left, tmpR+1)
 		if err == ErrCompacted {
-			return nil, err
+			log.Warn(err)
+			return nil, nil
 		} else if err == ErrUnavailable {
-			panic(fmt.Sprintf("entries[%d:%d] is unavailable from storage", left, min(right, l.stabled)+1))
+			//panic(fmt.Sprintf("entries[%d:%d] is unavailable from storage", left, min(right, l.stabled)+1))
+			log.Warn(err)
+			return nil, nil
 		} else if err != nil {
-			panic(err)
+			//panic(err)
+			log.Warn(err)
+			return nil, nil
 		}
 
 		if len(ents) > 0 {
@@ -180,6 +188,7 @@ func (l *RaftLog) sliceInAll(left, right uint64) ([]pb.Entry, error) {
 			ents = storedEnts
 		}
 	}
+
 	return ents, nil
 }
 

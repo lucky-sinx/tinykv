@@ -46,12 +46,16 @@ func (r *splitCheckHandler) Handle(t worker.Task) {
 		hex.EncodeToString(region.StartKey), hex.EncodeToString(region.EndKey))
 	key := r.splitCheck(regionId, region.StartKey, region.EndKey)
 	if key != nil {
+		engine_util.DPrintf(" FailSplit7")
+
 		_, userKey, err := codec.DecodeBytes(key)
 		if err == nil {
+			engine_util.DPrintf(" FailSplit6-%v", err)
 			// It's not a raw key.
 			// To make sure the keys of same user key locate in one Region, decode and then encode to truncate the timestamp
 			key = codec.EncodeBytes(userKey)
 		}
+		//要split则通过router发送消息，需要检测RegionEpoch，无callback
 		msg := message.Msg{
 			Type:     message.MsgTypeSplitRegion,
 			RegionID: regionId,
@@ -70,6 +74,7 @@ func (r *splitCheckHandler) Handle(t worker.Task) {
 }
 
 /// SplitCheck gets the split keys by scanning the range.
+// 检查是否要拆分region，如果未拆分更新peer.ApproximateSize，拆分则返回一个splitKey表示从哪里拆分
 func (r *splitCheckHandler) splitCheck(regionID uint64, startKey, endKey []byte) []byte {
 	txn := r.engine.NewTransaction(false)
 	defer txn.Discard()
@@ -82,12 +87,15 @@ func (r *splitCheckHandler) splitCheck(regionID uint64, startKey, endKey []byte)
 		key := item.Key()
 		if engine_util.ExceedEndKey(key, endKey) {
 			// update region size
+			// 扫描完了region的startKey到endKey，更新peer.ApproximateSize用于减少split的次数
 			r.router.Send(regionID, message.Msg{
 				Type: message.MsgTypeRegionApproximateSize,
 				Data: r.checker.currentSize,
 			})
 			break
 		}
+		// 记录所有value的大小和，当扫到某个key时超过了splitSize，记录下要从哪个key处split
+		// 注意要超过maxSize后才进行拆分，splitSize只是让每一次拆分出来的region大概这个大小
 		if r.checker.onKv(key, item) {
 			break
 		}
@@ -119,6 +127,7 @@ func (checker *sizeSplitChecker) onKv(key []byte, item engine_util.DBItem) bool 
 	valueSize := uint64(item.ValueSize())
 	size := uint64(len(key)) + valueSize
 	checker.currentSize += size
+	engine_util.DPrintf(" FailSplitOnkv-currentSize-%v,splitSize-%v，maxSize-%v", checker.currentSize, checker.splitSize, checker.maxSize)
 	if checker.currentSize > checker.splitSize && checker.splitKey == nil {
 		checker.splitKey = util.SafeCopy(key)
 	}

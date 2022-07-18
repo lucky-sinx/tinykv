@@ -292,6 +292,7 @@ func (r *Raft) dealReplication(to uint64) {
 	//需要发送的所有entry
 	lastIndex := r.RaftLog.LastIndex()
 	if lastIndex >= pr.Next {
+		DPrintf("[%v] -- pengdingSnap-%v,l-%v,r-%v,firstIndex-%v,entry-%v", r.id, r.RaftLog.pendingSnapshot, pr.Next, r.RaftLog.LastIndex(), r.RaftLog.FirstIndex(), r.RaftLog.entries)
 		tmpEntries, _ := r.RaftLog.sliceInAll(pr.Next, r.RaftLog.LastIndex())
 		for i, _ := range tmpEntries {
 			// 记住取不同位置的指针要用tmpEntries[i]，而不是_,entry = ...，否则实际上是同一个地址
@@ -301,6 +302,9 @@ func (r *Raft) dealReplication(to uint64) {
 	// 就算没新数据，preLogIndex应该也是最后一个Log的Index
 	m.Index = pr.Next - 1
 	m.LogTerm, _ = r.RaftLog.Term(m.Index)
+
+	DPrintf("[%v] -- Send[AERequest](preIndex,preTerm) -- entry-[%v,%v],to-%v,next-%v,lastIndex-%v", r.id, m.Index, m.LogTerm, to, r.Prs[to].Next, lastIndex)
+
 	r.send(m)
 }
 
@@ -334,16 +338,17 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		Commit: min(r.Prs[to].Match, r.RaftLog.committed),
 	}
 	r.send(m)
-
 }
 
 // Leader Transfer，触发超时选举
 func (r *Raft) sendTimeout(to uint64) {
-	DPrintf("[%v]--Begin Transfer Leader--:term-%v,to-%v", r.id, r.Term, to)
+	DPrintf("[%v]--Begin Transfer Leader--:term-%v,to-%v,myCommitted-%v,match-%v", r.id, r.Term, to, r.RaftLog.committed, r.Prs[to].Match)
 	r.send(pb.Message{
 		MsgType: pb.MessageType_MsgTimeoutNow,
 		To:      to,
 		From:    r.id,
+		// confChange在两节点时保证了Transfer一定成功被Follow接收，需要更新commit
+		//Commit: min(r.Prs[to].Match, r.RaftLog.committed),
 	})
 }
 
@@ -458,7 +463,7 @@ func (r *Raft) becomeCandidate() {
 	r.Vote = r.id
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
-	DPrintf("[%v]--init--:Candidate--[Term-%v,Lead-%v]", r.id, r.Term, r.Lead)
+	DPrintf("[%v]--init--:Candidate--[Term-%v,Lead-%v,commit-%v]，prs-%v", r.id, r.Term, r.Lead, r.RaftLog.committed, r.Prs)
 
 }
 
@@ -492,6 +497,7 @@ func (r *Raft) appendEntry(entries ...*pb.Entry) {
 
 	// cnt记录添加成功的entry个数
 	var cnt uint64 = 0
+	hasConfChange := false
 	for i := range entries {
 		//需要判断是否可以config change
 		//重复消息没有影响
@@ -499,19 +505,25 @@ func (r *Raft) appendEntry(entries ...*pb.Entry) {
 			if r.RaftLog.applied < r.PendingConfIndex {
 				continue
 			}
+			hasConfChange = true
 			r.PendingConfIndex = lastIndex + cnt + 1
 		}
 		cnt++
 		entries[i].Term = r.Term
 		entries[i].Index = lastIndex + cnt
 		r.RaftLog.entries = append(r.RaftLog.entries, *entries[i])
+		if hasConfChange {
+			DPrintf("[%v]--AcceptConfigChange--:new entry at Index-%v Term-%v,entry-%v", r.id, entries[i].Index, entries[i].Term, entries[i])
+		}
 	}
 	r.Prs[r.id].Match = lastIndex + cnt
 	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
 	if len(r.Prs) == 1 {
 		r.updateCommitIndexL()
 	}
-	DPrintf("[%v]--AcceptCommand--:new entry at Index-[%v,%v] Term-%v", r.id, lastIndex+1, lastIndex+cnt, r.Term)
+	if !hasConfChange && cnt >= 1 {
+		DPrintf("[%v]--AcceptCommand--:new entry at Index-[%v,%v] Term-%v", r.id, lastIndex+1, lastIndex+cnt, r.Term)
+	}
 }
 
 // 处理Leader消息
@@ -620,12 +632,24 @@ func (r *Raft) stepFollow(m *pb.Message) error {
 		r.send(*m)
 	// 收到Leader Transfer发来的MsgTimeoutNow
 	case pb.MessageType_MsgTimeoutNow:
+		//通过Transfer更新commitIndex
+		//DPrintf("[%v]--FollowTimeout--:msgCommit-%v,Term-%v", r.id, m.Commit, r.Term)
+		//if m.Term >= r.Term {
+		//	if m.Commit > r.RaftLog.committed {
+		//		//nxtCommitMax := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
+		//		nxtCommit := min(m.Commit, r.RaftLog.LastIndex())
+		//		DPrintf("[%v]--FollowReceiveTimeout--UpdateCommit--:commitIndex-%v,nxtCommitMax-%v,Term-%v", r.id, r.RaftLog.committed, nxtCommit, r.Term)
+		//		r.RaftLog.committed = nxtCommit
+		//	}
+		//}
+
 		r.electionElapsed = 0
-		r.Step(pb.Message{
-			MsgType: pb.MessageType_MsgHup,
-			To:      r.id,
-			From:    r.id,
-		})
+		r.Step(
+			pb.Message{
+				MsgType: pb.MessageType_MsgHup,
+				To:      r.id,
+				From:    r.id,
+			})
 	// 发送Vote
 	case pb.MessageType_MsgHup:
 		r.broadcastVote()
@@ -655,6 +679,17 @@ func (r *Raft) stepCandidate(m *pb.Message) error {
 	case pb.MessageType_MsgPropose:
 		DPrintf("[%v]--no leader at term-%v,Candidate drop Propose", r.id, r.Term)
 		return ErrProposalDropped
+	// 收到Leader Transfer发来的MsgTimeoutNow
+	//case pb.MessageType_MsgTimeoutNow:
+	//	//通过Transfer更新commitIndex
+	//	if m.Term >= r.Term {
+	//		if m.Commit > r.RaftLog.committed {
+	//			//nxtCommitMax := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
+	//			nxtCommit := min(m.Commit, r.RaftLog.LastIndex())
+	//			DPrintf("[%v]--CandidateReceiveTimeout--UpdateCommit--:commitIndex-%v,nxtCommitMax-%v,Term-%v", r.id, r.RaftLog.committed, nxtCommit, r.Term)
+	//			r.RaftLog.committed = nxtCommit
+	//		}
+	//	}
 	// 发送Vote
 	case pb.MessageType_MsgHup:
 		r.broadcastVote()
@@ -925,6 +960,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		//if i-1 != m.Entries[j-1].Index {
 		//	panic(fmt.Sprintf("check the function,i-%v,m.Entries[j].Index-%v", i, m.Entries[j].Index))
 		//}
+		DPrintf("[%v]--AE_Request--Success--:To [%v],myTerm-%v,LeaderTerm-%v,afterIndex-%v,LastIndex-%v,myEntry-%v,appendEntry-%v,j-%v", m.From, r.id, r.Term, m.Term, i-1, r.RaftLog.LastIndex(), r.RaftLog.entries, m.Entries, j)
 		r.RaftLog.truncateAndAppend(getEntries(m.Entries[j:]))
 		DPrintf("[%v]--AE_Request--Success--:To [%v],myTerm-%v,LeaderTerm-%v,afterIndex-%v,LastIndex-%v", m.From, r.id, r.Term, m.Term, i-1, r.RaftLog.LastIndex())
 	}

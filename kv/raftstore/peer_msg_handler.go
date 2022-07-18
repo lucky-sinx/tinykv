@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -72,13 +73,14 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			d.Send(d.ctx.trans, rd.Messages)
 		}
 		if len(rd.CommittedEntries) != 0 {
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- -%v", d.Meta.StoreId, d.PeerId(), d.regionId, rd.CommittedEntries)
 			// 成功apply的entry
-			successCommitEntries := make([]eraftpb.Entry, 0)
-			for i, entry := range rd.CommittedEntries {
+			//successCommitEntries := make([]eraftpb.Entry, 0)
+			for _, entry := range rd.CommittedEntries {
 				kvWB := new(engine_util.WriteBatch)
 				if entry.EntryType == eraftpb.EntryType_EntryConfChange {
 					// confChange
-					d.configChange(&entry, kvWB)
+					d.handleConfigChange(&entry, kvWB)
 					//if configChangeState != 1 {
 					//	// 两节点，是Leader并且是RemoveNode自身的Log，则不提交该Log及之后的Log
 					//	// Transfer Leader
@@ -109,7 +111,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					d.process(&entry, kvWB)
 				}
 
-				successCommitEntries = append(successCommitEntries, rd.CommittedEntries[i])
+				//successCommitEntries = append(successCommitEntries, rd.CommittedEntries[i])
 
 				// Bug：removeNode后applyState已经清空，重新赋值会出问题
 				if d.stopped {
@@ -125,11 +127,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					panic(err)
 				}
 			}
-			rd.CommittedEntries = successCommitEntries
-			commitIndex := len(rd.CommittedEntries) - 1
-			if commitIndex >= 0 {
-				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ApplyIndex-%v,lastApplyEntry-%v", d.Meta.StoreId, d.PeerId(), d.regionId, rd.CommittedEntries[commitIndex].Index, rd.CommittedEntries[commitIndex])
-			}
+			//rd.CommittedEntries = successCommitEntries
+			//commitIndex := len(rd.CommittedEntries) - 1
+			//if commitIndex >= 0 {
+			//	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ApplyIndex-%v,lastApplyEntry-%v", d.Meta.StoreId, d.PeerId(), d.regionId, rd.CommittedEntries[commitIndex].Index, rd.CommittedEntries[commitIndex])
+			//}
 		}
 
 		//4. 最后通过Advance()函数来强制更新raft层的状态。
@@ -145,21 +147,35 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 		panic(err)
 	}
 	if msg.AdminRequest != nil {
-		// snapshot
+		// no callback
+		if d.checkEpochNotMatch(nil, msg, false) {
+			return
+		}
+
 		request := msg.AdminRequest
 		if request.CmdType == raft_cmdpb.AdminCmdType_CompactLog {
-			//CompactLogRequest modifies metadata, namely updates the RaftTruncatedState which is in the RaftApplyState.
-			//After that, you should schedule a task to raftlog-gc worker by ScheduleCompactLog. Raftlog-gc worker will do the actual log deletion work asynchronously.
-			//修改ApplyState.RaftTruncatedState
-			d.peerStorage.applyState.TruncatedState.Index = request.CompactLog.CompactIndex
-			d.peerStorage.applyState.TruncatedState.Term = request.CompactLog.CompactTerm
-			//异步删除Log,实际删除log的操作在raftLogGcTaskHandle中做
-			d.ScheduleCompactLog(request.CompactLog.CompactIndex)
-			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
+			d.handleCompactLog(request)
+		} else if request.CmdType == raft_cmdpb.AdminCmdType_Split {
+			d.handleSplit(request, kvWB)
 		}
 		return
 	}
 	if len(msg.Requests) != 0 {
+		if d.checkEpochNotMatch(entry, msg, true) {
+			return
+		}
+
+		// 仅Write相关操作是batch的
+		// 和824不同，貌似没有记录重复消息的地方
+		request := msg.Requests[0]
+
+		// 因为可能存在split，当请求错误的region时应该返回错误
+		if err = d.checkKeyNotInRegion(request); err != nil {
+			d.callbackPropose(entry, ErrResp(err), nil)
+			return
+		}
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, entry.Index, entry.Term, msg.Requests)
+
 		// apply所有外部请求
 		for _, request := range msg.Requests {
 			switch request.CmdType {
@@ -174,51 +190,13 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 			}
 		}
 
-		// call back
+		// 返回结果
 		if len(d.proposals) != 0 {
-			// p.proposal是按照index顺序插入的
-			var pro *proposal
-			// 找到index和term对应的proposal
-			// 一开始以为proposals中的Index是递增的，但实际上可能Log被截断后新propose的Log Index变小了。（不知道为什么也能过测试）
-			// 但由于被截断Term肯定变大，因此Term是递增的
-
-			// 删除所有过时的proposal
-			for pro = d.proposals[0]; pro.term < entry.Term; pro = d.proposals[0] {
-				//ErrStaleCommand: It may due to leader changes that some logs are not committed and overrided with new leaders’ logs.
-				//But the client doesn’t know that and is still waiting for the response.
-				//So you should return this to let the client knows and retries the command again.
-				// Term不匹配
-				pro.cb.Done(ErrRespStaleCommand(entry.Term))
-				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ErrStale[Normal]Command-TermUnMatch(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, pro.index, pro.term, entry.Index, entry.Term)
-				d.proposals = d.proposals[1:]
-				if len(d.proposals) == 0 {
-					return
-				}
-			}
-			// 同Term的Index肯定递增
-			for ; pro.index < entry.Index && pro.term == entry.Term; pro = d.proposals[0] {
-				// index不匹配
-				pro.cb.Done(ErrResp(&util.ErrStaleCommand{}))
-				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ErrStale[Normal]Command-IndexLittle(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, pro.index, pro.term, entry.Index, entry.Term)
-				d.proposals = d.proposals[1:]
-				if len(d.proposals) == 0 {
-					return
-				}
-			}
-			if pro.term > entry.Term || pro.index > entry.Index {
-				// 当前entry没有对应proposal
-				return
-			}
-
-			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, entry.Index, entry.Term, msg.Requests)
-
 			header := &raft_cmdpb.RaftResponseHeader{}
 			response := &raft_cmdpb.RaftCmdResponse{
 				Header: header,
 			}
-			// 仅Write相关操作是batch的
-			// 和824不同，貌似没有记录重复消息的地方
-			request := msg.Requests[0]
+
 			switch request.CmdType {
 			case raft_cmdpb.CmdType_Get:
 				get := request.Get
@@ -252,15 +230,15 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 				if err != nil {
 					panic(err)
 				}
-
+				//engine_util.DPrintf("SNAP,region-%v", responseRegion)
 				response.Responses = []*raft_cmdpb.Response{{
 					CmdType: raft_cmdpb.CmdType_Snap,
 					Snap:    &raft_cmdpb.SnapResponse{Region: responseRegion},
 				}}
-				pro.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				d.callbackPropose(entry, response, d.peerStorage.Engines.Kv.NewTransaction(false))
+				return
 			}
-			pro.cb.Done(response)
-			d.proposals = d.proposals[1:]
+			d.callbackPropose(entry, response, nil)
 		}
 	}
 }
@@ -276,17 +254,22 @@ func (d *peerMsgHandler) checkInPeers(peerId uint64) bool {
 }
 
 // 修改config，addNode,removeNode
-// 三种返回值，成功configChange返回1，两节点Leader删除自身失败需要transfer返回2，两节点Follow删除Leader失败需要等到Leader Transfer成功返回3
-func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) int {
+// （旧的想法）三种返回值，成功configChange返回1，两节点Leader删除自身失败需要transfer返回2，两节点Follow删除Leader失败需要等到Leader Transfer成功返回3
+func (d *peerMsgHandler) handleConfigChange(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) int {
 	cc := new(eraftpb.ConfChange)
 	err := cc.Unmarshal(entry.Data)
 	if err != nil {
 		panic(err)
 	}
-	peerContext := new(metapb.Peer)
-	err = peerContext.Unmarshal(cc.Context)
+	cmpRequest := new(raft_cmdpb.RaftCmdRequest)
+	err = cmpRequest.Unmarshal(cc.Context)
 	if err != nil {
 		panic(err)
+	}
+	peerContext := cmpRequest.AdminRequest.ChangePeer.Peer
+	if d.checkEpochNotMatch(nil, cmpRequest, false) {
+		//engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ConfigChange-EpochNotMatch(stoneId,peerID)--epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id, d.Region().RegionEpoch)
+		return 1
 	}
 
 	if cc.ChangeType == eraftpb.ConfChangeType_AddNode {
@@ -340,7 +323,7 @@ func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.Wr
 			//	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v]--WantDeleteLeaderTimes-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.WantDeleteLeaderTimes)
 			//	return 2
 			//}
-			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- DestroyNode(stoneId,peerID)--[%v,%v],confVersion-%v", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id, d.Region().RegionEpoch.ConfVer)
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- RemoveNode[DestroyNode](stoneId,peerID)--[%v,%v],confVersion-%v", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id, d.Region().RegionEpoch.ConfVer)
 			d.destroyPeer()
 			return 1
 		}
@@ -391,6 +374,165 @@ func (d *peerMsgHandler) configChange(entry *eraftpb.Entry, kvWB *engine_util.Wr
 	return 1
 }
 
+// 处理CompactLog Log
+func (d *peerMsgHandler) handleCompactLog(request *raft_cmdpb.AdminRequest) {
+	//CompactLogRequest modifies metadata, namely updates the RaftTruncatedState which is in the RaftApplyState.
+	//After that, you should schedule a task to raftlog-gc worker by ScheduleCompactLog. Raftlog-gc worker will do the actual log deletion work asynchronously.
+	// 可能snapshot了，后来apply compact导致truncatedState改变，出现错误
+	if request.CompactLog.CompactIndex <= d.peerStorage.applyState.TruncatedState.Index {
+		return
+	}
+	//修改ApplyState.RaftTruncatedState
+	d.peerStorage.applyState.TruncatedState.Index = request.CompactLog.CompactIndex
+	d.peerStorage.applyState.TruncatedState.Term = request.CompactLog.CompactTerm
+	//异步删除Log,实际删除log的操作在raftLogGcTaskHandle中做
+	d.ScheduleCompactLog(request.CompactLog.CompactIndex)
+	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Compact]Command(compactIndex,compactTerm) -- entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, request.CompactLog.CompactIndex, request.CompactLog.CompactTerm)
+}
+
+// 处理split Log
+func (d *peerMsgHandler) handleSplit(request *raft_cmdpb.AdminRequest, kvWB *engine_util.WriteBatch) {
+	split := request.Split
+	// 有重复split，会导致startKey > endKey
+	err := util.CheckKeyInRegion(split.SplitKey, d.Region())
+	if err != nil {
+		return
+	}
+	// 新建region，注意要将region.peers排序后分配peerId，不然可能不同peer上新建时newPeerId对应分裂的peer不同
+	for i, _ := range d.Region().Peers {
+		for j := i + 1; j < len(d.Region().Peers); j++ {
+			if d.Region().Peers[j].Id < d.Region().Peers[i].Id {
+				tmp := d.Region().Peers[i]
+				d.Region().Peers[i] = d.Region().Peers[j]
+				d.Region().Peers[j] = tmp
+			}
+		}
+	}
+	newRegion := &metapb.Region{
+		Id:       split.NewRegionId,
+		StartKey: split.SplitKey,
+		EndKey:   d.Region().EndKey,
+		RegionEpoch: &metapb.RegionEpoch{
+			ConfVer: 1,
+			Version: 1,
+		},
+		Peers: make([]*metapb.Peer, 0),
+	}
+	for i, peer := range d.Region().Peers {
+		newRegion.Peers = append(newRegion.Peers, &metapb.Peer{Id: split.NewPeerIds[i], StoreId: peer.StoreId})
+	}
+	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+	if err != nil {
+		panic(err)
+	}
+	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Split]Command -- splitKey-%v,startKey-%v,endKey-%v,epoch-%v,newRegionId-%v,oldPeers-%v,newPeers-%v", d.Meta.StoreId, d.PeerId(), d.regionId, split.SplitKey, d.Region().StartKey, d.Region().EndKey, d.Region().RegionEpoch, split.NewRegionId, d.Region().Peers, split.NewPeerIds)
+
+	d.Region().EndKey = split.SplitKey
+	d.Region().RegionEpoch.Version++
+
+	_ = d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
+
+	// 修改元数据
+	d.ctx.storeMeta.Lock()
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: d.Region()})
+	d.ctx.storeMeta.regions[newRegion.Id] = newRegion
+	d.ctx.storeMeta.regions[d.Region().Id] = d.Region()
+	d.ctx.storeMeta.Unlock()
+
+	kvWB.SetMeta(meta.RegionStateKey(d.Region().Id), &rspb.RegionLocalState{
+		State:  rspb.PeerState_Normal,
+		Region: d.Region(),
+	})
+	kvWB.SetMeta(meta.RegionStateKey(newRegion.Id), &rspb.RegionLocalState{
+		State:  rspb.PeerState_Normal,
+		Region: newRegion,
+	})
+
+	d.ctx.router.register(newPeer)
+	_ = d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
+
+}
+
+// 检查key是否在region范围中
+func (d *peerMsgHandler) checkKeyNotInRegion(request *raft_cmdpb.Request) error {
+	// 因为可能存在split，当请求错误的region时应该返回错误
+	var key []byte
+	switch request.CmdType {
+	case raft_cmdpb.CmdType_Get:
+		key = request.Get.Key
+	case raft_cmdpb.CmdType_Put:
+		key = request.Put.Key
+	case raft_cmdpb.CmdType_Delete:
+		key = request.Delete.Key
+	}
+	if request.CmdType != raft_cmdpb.CmdType_Snap {
+		// ErrKeyNotInRegion
+		err := util.CheckKeyInRegion(key, d.Region())
+		return err
+	}
+	return nil
+}
+
+// 检查msg的RegionEpoch是否和当前RegionEpoch相匹配
+func (d *peerMsgHandler) checkEpochNotMatch(entry *eraftpb.Entry, msg *raft_cmdpb.RaftCmdRequest, shouldCallback bool) bool {
+	// 检查msg版本，同preProposeRaftCommand
+	err := util.CheckRegionEpoch(msg, d.Region(), true)
+	if errEpochNotMatching, ok := err.(*util.ErrEpochNotMatch); ok {
+		siblingRegion := d.findSiblingRegion()
+		if siblingRegion != nil {
+			errEpochNotMatching.Regions = append(errEpochNotMatching.Regions, siblingRegion)
+		}
+		if shouldCallback {
+			d.callbackPropose(entry, ErrResp(errEpochNotMatching), nil)
+		}
+		return true
+	}
+	return false
+}
+func (d *peerMsgHandler) callbackPropose(entry *eraftpb.Entry, response *raft_cmdpb.RaftCmdResponse, txn *badger.Txn) {
+	// call back
+	if len(d.proposals) != 0 {
+		// p.proposal是按照index顺序插入的
+		var pro *proposal
+		// 找到index和term对应的proposal
+		// 一开始以为proposals中的Index是递增的，但实际上可能Log被截断后新propose的Log Index变小了。（不知道为什么也能过测试）
+		// 但由于被截断Term肯定变大，因此Term是递增的
+
+		// 删除所有过时的proposal
+		for pro = d.proposals[0]; pro.term < entry.Term; pro = d.proposals[0] {
+			//ErrStaleCommand: It may due to leader changes that some logs are not committed and overrided with new leaders’ logs.
+			//But the client doesn’t know that and is still waiting for the response.
+			//So you should return this to let the client knows and retries the command again.
+			// Term不匹配
+			pro.cb.Done(ErrRespStaleCommand(entry.Term))
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ErrStale[Normal]Command-TermUnMatch(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, pro.index, pro.term, entry.Index, entry.Term)
+			d.proposals = d.proposals[1:]
+			if len(d.proposals) == 0 {
+				return
+			}
+		}
+		// 同Term的Index肯定递增
+		for ; pro.index < entry.Index && pro.term == entry.Term; pro = d.proposals[0] {
+			// index不匹配
+			pro.cb.Done(ErrResp(&util.ErrStaleCommand{}))
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ErrStale[Normal]Command-IndexLittle(index,term) -- old-[%v,%v],entry-[%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, pro.index, pro.term, entry.Index, entry.Term)
+			d.proposals = d.proposals[1:]
+			if len(d.proposals) == 0 {
+				return
+			}
+		}
+		if pro.term > entry.Term || pro.index > entry.Index {
+			// 当前entry没有对应proposal
+			return
+		}
+		if txn != nil {
+			pro.cb.Txn = txn
+		}
+		pro.cb.Done(response)
+		d.proposals = d.proposals[1:]
+	}
+}
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	switch msg.Type {
 	// 处理Raft Message，即其他节点发送过来的Raft内部消息
@@ -469,8 +611,11 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	// Normal request
 	if msg.AdminRequest == nil {
 		// 对于外部请求，记录它所在的位置
-		// 后面分区时用
-		//err := util.CheckKeyInRegion(msg.Requests[0])
+		// 检查key是否在region范围中
+		if err = d.checkKeyNotInRegion(msg.Requests[0]); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
 		// 使用Proposal来保留[index, term, callback]，callback通过channel便于在后面提交的时候进行process
 		d.proposals = append(d.proposals, &proposal{
 			index: d.nextProposalIndex(),
@@ -519,7 +664,8 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				return
 			}
 
-			peerContext, err := request.ChangePeer.Peer.Marshal()
+			// 后面需要检验Region Epoch，需要将msg也放入
+			peerContext, err := msg.Marshal()
 			if err != nil {
 				panic(err)
 			}
@@ -541,6 +687,25 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				cb.Done(response)
 			}
 			return
+		} else if request.CmdType == raft_cmdpb.AdminCmdType_Split {
+			data, err := msg.Marshal()
+			if err != nil {
+				panic(err)
+			}
+			err = d.RaftGroup.Propose(data)
+			if err != nil {
+				cb.Done(ErrResp(err))
+				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit1-%v,Propose[Split]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, err, d.RaftGroup.Raft.RaftLog.LastIndex(), d.Term(), request.Split)
+
+				return
+			} else {
+				response.AdminResponse = &raft_cmdpb.AdminResponse{
+					CmdType: raft_cmdpb.AdminCmdType_Split,
+					Split:   &raft_cmdpb.SplitResponse{},
+				}
+				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Propose[Split]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, d.RaftGroup.Raft.RaftLog.LastIndex(), d.Term(), request.Split)
+				cb.Done(response)
+			}
 		}
 	}
 	var data []byte
@@ -914,6 +1079,7 @@ func (d *peerMsgHandler) onSplitRegionCheckTick() {
 	if !d.IsLeader() {
 		return
 	}
+	// 减少splitCheckTask的次数
 	if d.ApproximateSize != nil && d.SizeDiffHint < d.ctx.cfg.RegionSplitSize/8 {
 		return
 	}
@@ -924,10 +1090,15 @@ func (d *peerMsgHandler) onSplitRegionCheckTick() {
 }
 
 func (d *peerMsgHandler) onPrepareSplitRegion(regionEpoch *metapb.RegionEpoch, splitKey []byte, cb *message.Callback) {
+	// 验证是否应该执行该split
 	if err := d.validateSplitRegion(regionEpoch, splitKey); err != nil {
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit2-%v,Propose[Split]Command(index,term,request) ", d.Meta.StoreId, d.PeerId(), d.regionId, err)
+
 		cb.Done(ErrResp(err))
 		return
 	}
+	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit3,Propose[Split]Command(index,term,request) ", d.Meta.StoreId, d.PeerId(), d.regionId)
+
 	region := d.Region()
 	d.ctx.schedulerTaskSender <- &runner.SchedulerAskSplitTask{
 		Region:   region,

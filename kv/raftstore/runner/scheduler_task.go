@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
@@ -87,12 +88,17 @@ func (r *SchedulerTaskHandler) onRegionHeartbeatResponse(resp *schedulerpb.Regio
 }
 
 func (r *SchedulerTaskHandler) onAskSplit(t *SchedulerAskSplitTask) {
+	// 分配新的regionId以及peerId
+	// 在测试中使用的SchedulerClient是test_raftstore.scheduler
 	resp, err := r.SchedulerClient.AskSplit(context.TODO(), t.Region)
 	if err != nil {
 		log.Error(err)
+		engine_util.DPrintf(" FailSplit5-%v", err)
+
 		return
 	}
 
+	//通过Router发送AdminCmdType_Split
 	aq := &raft_cmdpb.AdminRequest{
 		CmdType: raft_cmdpb.AdminCmdType_Split,
 		Split: &raft_cmdpb.SplitRequest{
