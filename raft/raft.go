@@ -292,7 +292,7 @@ func (r *Raft) dealReplication(to uint64) {
 	//需要发送的所有entry
 	lastIndex := r.RaftLog.LastIndex()
 	if lastIndex >= pr.Next {
-		DPrintf("[%v] -- pengdingSnap-%v,l-%v,r-%v,firstIndex-%v,entry-%v", r.id, r.RaftLog.pendingSnapshot, pr.Next, r.RaftLog.LastIndex(), r.RaftLog.FirstIndex(), r.RaftLog.entries)
+		//DPrintf("[%v] -- pengdingSnap-%v,l-%v,r-%v,firstIndex-%v,entry-%v", r.id, r.RaftLog.pendingSnapshot, pr.Next, r.RaftLog.LastIndex(), r.RaftLog.FirstIndex(), r.RaftLog.entries)
 		tmpEntries, _ := r.RaftLog.sliceInAll(pr.Next, r.RaftLog.LastIndex())
 		for i, _ := range tmpEntries {
 			// 记住取不同位置的指针要用tmpEntries[i]，而不是_,entry = ...，否则实际上是同一个地址

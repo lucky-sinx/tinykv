@@ -16,6 +16,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"path"
 	"sync"
 	"time"
@@ -279,7 +280,39 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	// 测试有regionEpoch为空
+	if region.GetRegionEpoch() == nil {
+		return nil
+	}
+	oldRegion := c.GetRegion(region.GetID())
 
+	// 检测该region是否stale
+	if oldRegion == nil {
+		//scan all regions that overlap with it. The heartbeats’ conf_ver and version should be greater or equal than all of them, or the region is stale.
+		// 获取所有相交的region
+		intersectRegions := c.core.ScanRange(region.GetStartKey(), region.GetEndKey(), -1)
+		for _, intersectRegion := range intersectRegions {
+			if util.IsEpochStale(region.GetRegionEpoch(), intersectRegion.GetRegionEpoch()) {
+				return ErrRegionIsStale(region.GetMeta(), intersectRegion.GetMeta())
+			}
+		}
+	}
+
+	if oldRegion != nil && util.IsEpochStale(region.GetRegionEpoch(), oldRegion.GetRegionEpoch()) {
+		// Check whether there is a region with the same Id in local storage. If there is and at least one of the heartbeats’ conf_ver and version is less than its, this heartbeat region is stale
+		return ErrRegionIsStale(region.GetMeta(), oldRegion.GetMeta())
+	}
+	// region tree :修改该region中所有peer对应的store信息（创建及删除store，修改对应的leaders/follows/Learners/pendingPeers以及approximateSize)
+	// 并且修改对应regionId的信息，如totalSize
+	// 对于每个store，按照leader，follow的角色分别存储其相关数据
+	err := c.putRegion(region)
+	if err != nil {
+		return err
+	}
+	// 修改storeInfo
+	for storeId := range region.GetStoreIds() {
+		c.updateStoreStatusLocked(storeId)
+	}
 	return nil
 }
 
