@@ -12,6 +12,7 @@ import (
 
 const TsMax uint64 = ^uint64(0)
 
+// Lock The lock CF is accessed using the user key; it stores a serialized Lock data structure
 type Lock struct {
 	Primary []byte
 	Ts      uint64
