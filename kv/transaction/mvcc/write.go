@@ -11,6 +11,8 @@ import (
 // A serialized version is stored in the "write" CF of our engine when a write is committed. That allows MvccTxn to find
 // the status of a key at a given timestamp.
 // The write CF is accessed using the user key and the commit timestamp of the transaction in which it was written; it stores a Write data structure
+// Write 记录有一种类型是 Rollback。这种记录用于标记被回滚的事务，其 commit_ts 被设为与 start_ts 相同。这一做法是 Percolator 论文中没有提到的。
+//这样，如果在 rollback 之后收到同一个事务的 prewrite，则会由于 prewrite 的这部分代码而直接返回错误（写写冲突）
 type Write struct {
 	StartTS uint64
 	Kind    WriteKind

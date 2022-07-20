@@ -378,7 +378,8 @@ func (d *peerMsgHandler) handleConfigChange(entry *eraftpb.Entry, kvWB *engine_u
 func (d *peerMsgHandler) handleCompactLog(request *raft_cmdpb.AdminRequest) {
 	//CompactLogRequest modifies metadata, namely updates the RaftTruncatedState which is in the RaftApplyState.
 	//After that, you should schedule a task to raftlog-gc worker by ScheduleCompactLog. Raftlog-gc worker will do the actual log deletion work asynchronously.
-	// 可能snapshot了，后来apply compact导致truncatedState改变，出现错误
+	// 可能snapshot了，后来apply compact导致truncatedState改变，出现错误，即truncatedState变小了，有一些Log不存在，但因为读取Log.firstIndex时显示其存在,
+	// RaftLog中因为snapShot时把Entry删除了，去storage中找也找不到
 	if request.CompactLog.CompactIndex <= d.peerStorage.applyState.TruncatedState.Index {
 		return
 	}
