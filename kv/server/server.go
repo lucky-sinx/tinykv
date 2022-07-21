@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
@@ -60,6 +61,50 @@ func (server *Server) bindGetErr(resp *kvrpcpb.GetResponse, err error) (*kvrpcpb
 	}
 	return nil, err
 }
+func (server *Server) bindPreWriteErr(resp *kvrpcpb.PrewriteResponse, err error) (*kvrpcpb.PrewriteResponse, error) {
+	if regionErr, ok := err.(*raft_storage.RegionError); ok {
+		resp.RegionError = regionErr.RequestErr
+		return resp, nil
+	}
+	return nil, err
+}
+func (server *Server) bindCommitErr(resp *kvrpcpb.CommitResponse, err error) (*kvrpcpb.CommitResponse, error) {
+	if regionErr, ok := err.(*raft_storage.RegionError); ok {
+		resp.RegionError = regionErr.RequestErr
+		return resp, nil
+	}
+	return nil, err
+}
+func (server *Server) bindScanErr(resp *kvrpcpb.ScanResponse, err error) (*kvrpcpb.ScanResponse, error) {
+	if regionErr, ok := err.(*raft_storage.RegionError); ok {
+		resp.RegionError = regionErr.RequestErr
+		return resp, nil
+	}
+	return nil, err
+}
+
+func (server *Server) bindCheckTxnStatusErr(resp *kvrpcpb.CheckTxnStatusResponse, err error) (*kvrpcpb.CheckTxnStatusResponse, error) {
+	if regionErr, ok := err.(*raft_storage.RegionError); ok {
+		resp.RegionError = regionErr.RequestErr
+		return resp, nil
+	}
+	return nil, err
+}
+
+func (server *Server) bindRollbackErr(resp *kvrpcpb.BatchRollbackResponse, err error) (*kvrpcpb.BatchRollbackResponse, error) {
+	if regionErr, ok := err.(*raft_storage.RegionError); ok {
+		resp.RegionError = regionErr.RequestErr
+		return resp, nil
+	}
+	return nil, err
+}
+func (server *Server) bindResolveErr(resp *kvrpcpb.ResolveLockResponse, err error) (*kvrpcpb.ResolveLockResponse, error) {
+	if regionErr, ok := err.(*raft_storage.RegionError); ok {
+		resp.RegionError = regionErr.RequestErr
+		return resp, nil
+	}
+	return nil, err
+}
 func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcpb.GetResponse, error) {
 	// Your Code Here (4B).
 	resp := new(kvrpcpb.GetResponse)
@@ -67,6 +112,7 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 	if err != nil {
 		return server.bindGetErr(resp, err)
 	}
+	defer reader.Close()
 
 	txn := mvcc.NewMvccTxn(reader, req.Version)
 
@@ -95,13 +141,6 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 	return resp, nil
 }
 
-func (server *Server) bindPreWriteErr(resp *kvrpcpb.PrewriteResponse, err error) (*kvrpcpb.PrewriteResponse, error) {
-	if regionErr, ok := err.(*raft_storage.RegionError); ok {
-		resp.RegionError = regionErr.RequestErr
-		return resp, nil
-	}
-	return nil, err
-}
 func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	// Your Code Here (4B).
 	resp := new(kvrpcpb.PrewriteResponse)
@@ -109,6 +148,7 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 	if err != nil {
 		return server.bindPreWriteErr(resp, err)
 	}
+	defer reader.Close()
 
 	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
 
@@ -180,14 +220,6 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 	return resp, nil
 }
 
-func (server *Server) bindCommitErr(resp *kvrpcpb.CommitResponse, err error) (*kvrpcpb.CommitResponse, error) {
-	if regionErr, ok := err.(*raft_storage.RegionError); ok {
-		resp.RegionError = regionErr.RequestErr
-		return resp, nil
-	}
-	return nil, err
-}
-
 func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
 	// Your Code Here (4B).
 	resp := new(kvrpcpb.CommitResponse)
@@ -195,6 +227,7 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 	if err != nil {
 		return server.bindCommitErr(resp, err)
 	}
+	defer reader.Close()
 
 	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
 
@@ -252,22 +285,246 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.ScanResponse)
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return server.bindScanErr(resp, err)
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.Version)
+	// 扫描全表获取不同的key
+	scan := mvcc.NewScanner(req.StartKey, txn)
+	defer scan.Close()
+	cnt := req.GetLimit()
+	for cnt != 0 {
+		key, value, err := scan.Next()
+		if err != nil {
+			return server.bindScanErr(resp, err)
+		}
+
+		//查找完成，没有值了
+		if key == nil && value == nil {
+			break
+		}
+
+		// 被delete了，应该找下一个key
+		if value == nil {
+			continue
+		}
+
+		// 在时间戳范围 [0,开始时间戳]（是右开区间） 内检查有没有锁
+		// 这个范围是在此次事务快照所有可见的时间戳。如果看到一个锁，表示另一个事务在并发的写这个cell，所以读事务必须等待直到此锁释放
+		lock, err1 := txn.GetLock(key)
+		if err1 != nil {
+			return server.bindScanErr(resp, err1)
+		}
+
+		cnt--
+
+		// 有锁了
+		if lock != nil && lock.Ts < req.Version {
+			resp.Pairs = append(resp.Pairs, &kvrpcpb.KvPair{
+				Error: &kvrpcpb.KeyError{
+					Locked: lock.Info(key),
+				},
+				Key:   nil,
+				Value: nil,
+			})
+			continue
+		}
+
+		resp.Pairs = append(resp.Pairs, &kvrpcpb.KvPair{
+			Error: nil,
+			Key:   key,
+			Value: value,
+		})
+	}
+
+	return resp, nil
 }
 
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.CheckTxnStatusResponse)
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return server.bindCheckTxnStatusErr(resp, err)
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.LockTs)
+	lock, err1 := txn.GetLock(req.PrimaryKey)
+	if err1 != nil {
+		return server.bindCheckTxnStatusErr(resp, err1)
+	}
+	if lock != nil && lock.Ts == req.LockTs {
+		// 超时，使用物理时钟判定
+		if mvcc.PhysicalTime(req.CurrentTs) >= mvcc.PhysicalTime(req.LockTs)+lock.Ttl {
+			// If the TTL of the transaction is exhausted, abort that transaction and roll back the primary lock.
+			// 删锁并rollback
+			txn.DeleteLock(req.PrimaryKey)
+			// rollback的commitTS设置为startTS
+			txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
+				StartTS: req.LockTs,
+				Kind:    mvcc.WriteKindRollback,
+			})
+			txn.DeleteValue(req.PrimaryKey)
+			err = server.storage.Write(req.Context, txn.Writes())
+			if err != nil {
+				return server.bindCheckTxnStatusErr(resp, err)
+			}
+			// The lock is rolled back because it has expired.
+			resp.Action = kvrpcpb.Action_TTLExpireRollback
+		} else {
+			// Otherwise, returns the TTL information.
+			// locked: lock_ttl > 0
+			resp.LockTtl = lock.Ttl
+		}
+	} else {
+		// If the transaction has previously been rolled back or committed, return that information.
+		write, commitTS, err := txn.CurrentWrite(req.PrimaryKey)
+		if err != nil {
+			return server.bindCheckTxnStatusErr(resp, err)
+		}
+		if write == nil {
+			// The lock does not exist, TinyKV left a record of the rollback, but did not
+			// have to delete a lock.
+			// 没有匹配的锁，也没有write，需要留一个Rollback
+			txn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
+				StartTS: req.LockTs,
+				Kind:    mvcc.WriteKindRollback,
+			})
+			err = server.storage.Write(req.Context, txn.Writes())
+			if err != nil {
+				return server.bindCheckTxnStatusErr(resp, err)
+			}
+			resp.Action = kvrpcpb.Action_LockNotExistRollback
+		} else if write.Kind != mvcc.WriteKindRollback {
+			// committed: commit_version > 0
+			resp.CommitVersion = commitTS
+		} else {
+			// 已经RollBack了,测试需要NoAction
+			resp.Action = kvrpcpb.Action_NoAction
+		}
+	}
+	return resp, nil
 }
 
 func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.BatchRollbackResponse)
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return server.bindRollbackErr(resp, err)
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+	for _, key := range req.Keys {
+		lock, err1 := txn.GetLock(key)
+		if err1 != nil {
+			return server.bindRollbackErr(resp, err1)
+		}
+
+		// 存在当前事务的行锁,rollback
+		if lock != nil && lock.Ts == req.StartVersion {
+			txn.DeleteLock(key)
+			txn.DeleteValue(key)
+			txn.PutWrite(key, req.StartVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			})
+			continue
+		}
+
+		write, _, err := txn.CurrentWrite(key)
+		if err != nil {
+			server.bindRollbackErr(resp, err)
+		}
+
+		if write == nil {
+			// 不存在write需要写入rollback
+			txn.PutWrite(key, req.StartVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			})
+			continue
+		}
+
+		// Will fail if the transaction has already been committed or keys are locked by a different transaction.
+		if write.Kind != mvcc.WriteKindRollback || lock != nil {
+			resp.Error = &kvrpcpb.KeyError{
+				Abort: "true",
+			}
+			return resp, nil
+		}
+		//If the keys were never locked, no action is needed but it is not an error.
+	}
+
+	// 将所有操作写入底层存储
+	err = server.storage.Write(req.Context, txn.Writes())
+	if err != nil {
+		return server.bindRollbackErr(resp, err)
+	}
+	return resp, nil
 }
 
 func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	resp := new(kvrpcpb.ResolveLockResponse)
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		return server.bindResolveErr(resp, err)
+	}
+	defer reader.Close()
+
+	txn := mvcc.NewMvccTxn(reader, req.StartVersion)
+
+	iter := reader.IterCF(engine_util.CfLock)
+	defer iter.Close()
+	for ; iter.Valid(); iter.Next() {
+		item := iter.Item()
+		lockByte, err := item.Value()
+		if err != nil {
+			return server.bindResolveErr(resp, err)
+		}
+		if lockByte == nil {
+			continue
+		}
+		lock, err1 := mvcc.ParseLock(lockByte)
+		if err1 != nil {
+			return server.bindResolveErr(resp, err1)
+		}
+		// 找到所有该transaction的lock
+		if lock.Ts != req.StartVersion {
+			continue
+		}
+
+		key := item.Key()
+		if req.CommitVersion == 0 {
+			// If commit_version is 0, TinyKV will rollback all locks.
+			txn.DeleteLock(key)
+			txn.DeleteValue(key)
+			txn.PutWrite(key, req.StartVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			})
+		} else {
+			// commit those locks with the given commit timestamp
+			txn.PutWrite(key, req.CommitVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    lock.Kind,
+			})
+			txn.DeleteLock(key)
+		}
+	}
+	// 将所有操作写入底层存储
+	err = server.storage.Write(req.Context, txn.Writes())
+	if err != nil {
+		return server.bindResolveErr(resp, err)
+	}
+	return resp, nil
 }
 
 // SQL push down commands.
