@@ -372,6 +372,11 @@ func (r *Raft) broadcastHeartBeat() {
 
 // 广播append消息
 func (r *Raft) broadcastVote() {
+	// 被remove的节点不能发起选举
+	_, ok := r.Prs[r.id]
+	if !ok {
+		return
+	}
 	r.becomeCandidate()
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
@@ -1057,5 +1062,8 @@ func (r *Raft) removeNode(id uint64) {
 	DPrintf("[%v]--RemoveNode-%v Success--term-%v", r.id, id, r.Term)
 
 	// 更新CommitIndex
-	r.updateCommitIndexL()
+	if r.State == StateLeader {
+		r.updateCommitIndexL()
+	}
+
 }
