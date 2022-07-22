@@ -274,7 +274,7 @@ func (c *Cluster) GetRegion(key []byte) *metapb.Region {
 		// retry to get the region again.
 		SleepMS(20)
 	}
-	//达成共识需要的时间有时候比较长，这就会导致新 region 中无法产生 leade 与 Scheduler 进行心跳交互，来更新 Scheduler 中的 regions，产生 find no region 的错误。这一部分可能需要 pre-vote 来进行根本性地解决
+	//达成共识需要的时间有时候比较长，这就会导致新 region 中无法产生 leade 与 Scheduler 进行心跳交互，来更新 Scheduler 中的 regions，产生 find no region 的错误。
 	panic(fmt.Sprintf("find no region for %s", hex.EncodeToString(key)))
 }
 

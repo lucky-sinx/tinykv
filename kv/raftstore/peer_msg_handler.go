@@ -453,6 +453,11 @@ func (d *peerMsgHandler) handleSplit(request *raft_cmdpb.AdminRequest, kvWB *eng
 	d.ctx.router.register(newPeer)
 	_ = d.ctx.router.send(newRegion.Id, message.Msg{RegionID: newRegion.Id, Type: message.MsgTypeStart})
 
+	// 帮助新region更新region信息，避免find no region（正常需要等到新Region的Leader当选会发送RegionHeartbeatTask）
+	if d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		newPeer.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
 }
 
 // 检查key是否在region范围中
