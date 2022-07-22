@@ -15,7 +15,6 @@
 package raft
 
 import (
-	"fmt"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -54,17 +53,21 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	dummyIndex uint64
+	dummyTerm  uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	log := &RaftLog{
-		storage:         storage,
-		pendingSnapshot: nil,
+	//return nil
+	if storage == nil {
+		log.Panic("storage is nil")
 	}
-	// storage中的是持久化了的数据
+	newLog := &RaftLog{
+		storage: storage,
+	}
 	firstIndex, err := storage.FirstIndex()
 	if err != nil {
 		panic(err)
@@ -73,18 +76,17 @@ func newLog(storage Storage) *RaftLog {
 	if err != nil {
 		panic(err)
 	}
-
-	log.committed = firstIndex - 1
-	log.applied = firstIndex - 1
-
-	log.stabled = lastIndex
-
-	// 将所有storage中的数据读出
-	log.entries, err = storage.Entries(firstIndex, lastIndex+1)
-	if log.entries == nil || err != nil {
-		log.entries = make([]pb.Entry, 0)
+	entries, err := storage.Entries(firstIndex, lastIndex+1)
+	if err != nil {
+		log.Debugf("!!!!!!!!!!!%+v  %+v", firstIndex, lastIndex)
+		panic(err)
 	}
-	return log
+	newLog.entries = entries
+	newLog.applied = firstIndex - 1
+	newLog.committed = firstIndex - 1
+	newLog.stabled = lastIndex //log entries with index <= stabled are persisted to storage.
+	newLog.dummyIndex = firstIndex - 1
+	return newLog
 }
 
 // We need to compact the log entries in some point of time like
@@ -92,227 +94,148 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
-	// 从firstIndex开始
-	firstIndex, _ := l.storage.FirstIndex()
-	if len(l.entries) != 0 && firstIndex > l.entries[0].Index {
-		l.entries = l.entries[firstIndex-l.entries[0].Index:]
+
+	// 检查applyState,在内存中删除[firstIndex...truncateIndex]的entries,更新dummyIndex、dummyTerm
+	firstIndex := l.firstIndex()
+	trueNextIndex, _ := l.storage.FirstIndex()
+	//log.Infof("RaftLog compact from %d to %d", firstIndex, trueNextIndex)
+
+	if trueNextIndex > firstIndex {
+		l.entries = l.entries[trueNextIndex-l.dummyIndex-1:]
+		l.dummyIndex = trueNextIndex - 1
+		term, err := l.storage.Term(l.dummyIndex)
+		if err != nil {
+
+		}
+		l.dummyTerm = term
 	}
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	if len(l.entries) == 0 {
-		return nil
-	}
-	return l.entries[l.stabled+1-l.entries[0].Index:]
-}
-
-// check l.firstIndex <= left <= right <= l.LastIndex
-// 在所有log中找
-func (l *RaftLog) checkOutOfBoundsInAll(left, right uint64) error {
-	fi := l.FirstIndex()
-	if left < l.FirstIndex() {
-		return ErrCompacted
-	}
-	li := l.LastIndex()
-	if right > li {
-		panic(fmt.Sprintf("All.slice[%d,%d] out of bound [%d,%d]", left, right, fi, li))
-	}
-	return nil
-}
-
-// 在该RaftLog中找
-func (l *RaftLog) checkOutOfBoundsInMemory(left, right uint64) error {
-	if len := len(l.entries); len == 0 || left < l.entries[0].Index || right > l.entries[len-1].Index {
-		panic(fmt.Sprintf("Memory.slice[%d,%d] out of bound", left, right))
-	}
-	return nil
-}
-
-// 获得所有存储上[left,right]之间的所有log
-func (l *RaftLog) sliceInAll(left, right uint64) ([]pb.Entry, error) {
-	if left > right {
-		return nil, nil
-	}
-	err := l.checkOutOfBoundsInAll(left, right)
-	if err != nil {
-		return nil, err
-	}
-
-	var ents []pb.Entry
-	// 先在内存中取数据
-	flag := false
-	if len(l.entries) != 0 && right >= l.entries[0].Index {
-		flag = true
-		getFromL := max(left, l.entries[0].Index)
-		err := l.checkOutOfBoundsInMemory(getFromL, right)
-		if err != nil {
-			panic(err)
-		}
-		unstable := l.entries[getFromL-l.entries[0].Index : right-l.entries[0].Index+1]
-		ents = unstable
-	}
-
-	// 在storage中取数据
-	var tmpR uint64
-	if !flag {
-		tmpR = right
-	} else {
-		tmpR = l.entries[0].Index - 1
-	}
-
-	// 比如entries为空，所有log都compact了left刚好等于truncIndex+1，此时不能去拿数据
-	// 实际上后来改成了所有没compact的Log都在内存中，这里没有用到
-	if len(l.entries) == 0 || left < l.entries[0].Index {
-		storedEnts, err := l.storage.Entries(left, tmpR+1)
-		if err == ErrCompacted {
-			log.Warn(err)
-			return nil, nil
-		} else if err == ErrUnavailable {
-			//panic(fmt.Sprintf("entries[%d:%d] is unavailable from storage", left, min(right, l.stabled)+1))
-			log.Warn(err)
-			return nil, nil
-		} else if err != nil {
-			//panic(err)
-			log.Warn(err)
-			return nil, nil
-		}
-
-		if len(ents) > 0 {
-			combined := make([]pb.Entry, len(storedEnts)+len(ents))
-			n := copy(combined, storedEnts)
-			copy(combined[n:], ents)
-			ents = combined
-		} else {
-			ents = storedEnts
-		}
-	}
-
-	return ents, nil
-}
-
-// 获得自身entries上[left,right]之间的所有log
-func (l *RaftLog) sliceInMemory(left, right uint64) []pb.Entry {
-	return l.entries[left-l.entries[0].Index : right-l.entries[0].Index+1]
+	//return nil
+	return l.entries[int(l.stabled-l.dummyIndex):]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	off := max(l.applied+1, l.FirstIndex())
-	if l.committed >= off {
-		ents, err := l.sliceInAll(off, l.committed)
-		if err != nil {
-			panic(fmt.Sprintf("unexpected error when getting unapplied entries (%v)", err))
-		}
-		return ents
-	}
-	return nil
-}
-
-// FirstIndex return the first index of the log entries
-func (l *RaftLog) FirstIndex() uint64 {
-	if l.pendingSnapshot != nil {
-		return l.pendingSnapshot.Metadata.Index + 1
-	}
-	index, err := l.storage.FirstIndex()
-	if err != nil {
-		panic(err)
-	}
-	return index
+	//return nil
+	return l.entries[int(l.applied-l.dummyIndex):int(l.committed-l.dummyIndex)]
 }
 
 // LastIndex return the last index of the log entries
-//
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	// 有未持久化的数据
-	if len := len(l.entries); len != 0 {
-		//错误
-		//stable表示持久化到了哪里，stable+len便是最后一个数据对应的index
-		//之后注意下snapshot的逻辑，貌似snapshot后stable也更新了
-		//return l.stabled + uint64(len)
+	//return 0
+	if len(l.entries) == 0 {
+		return l.dummyIndex
+	}
 
-		////原方法错误，测试中持久化后不调用advance，也就是l.entries和storage中的同时存在
-		return l.entries[len-1].Index
-	}
-	// 有可能所有entries的数据都snapshot了
-	if l.pendingSnapshot != nil {
-		return l.pendingSnapshot.Metadata.Index
-	}
-	i, err := l.storage.LastIndex()
+	return l.entries[0].Index + uint64(len(l.entries)) - 1
+}
+
+func (l *RaftLog) LastTerm() uint64 {
+	// Your Code Here (2A).
+	//return 0
+	term, err := l.Term(l.LastIndex())
 	if err != nil {
-		panic(err)
+		log.Panic(err)
 	}
-	return i
+	return term
+}
+
+func (l *RaftLog) firstIndex() uint64 {
+	if len(l.entries) == 0 {
+		return l.dummyIndex + 1
+	}
+	return l.entries[0].Index
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if i < l.FirstIndex()-1 || i > l.LastIndex() {
-		return 0, nil
+	//有效term范围[l.dummyIndex,l.lastIndex]
+	if i < l.dummyIndex {
+		return 0, ErrCompacted
 	}
-	// i不在内存entries中
-	if len(l.entries) == 0 || i < l.entries[0].Index {
-		if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
-			return l.pendingSnapshot.Metadata.Term, nil
-		} else {
-			t, err := l.storage.Term(i)
-			if err == nil {
-				return t, nil
-			}
-			if err == ErrCompacted || err == ErrUnavailable {
-				return 0, err
-			}
-			panic(err)
+	if i > l.LastIndex() {
+		return 0, ErrUnavailable
+	}
+	if i == l.dummyIndex {
+		return l.dummyTerm, nil
+	}
+	term := l.entries[i-l.firstIndex()].Term
+	return term, nil
+}
+
+func (l *RaftLog) appliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+	if l.committed < i || i < l.applied {
+		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
+	}
+	l.applied = i
+}
+
+func (l *RaftLog) truncateAndAppend(entries []*pb.Entry) {
+	//第一条数据索引
+	index := entries[0].Index
+	switch {
+	case index == l.LastIndex()+1:
+		//entries[0].Index==lastLogIndex+1,说明是完全新增的数据,直接append
+		for i := range entries {
+			l.entries = append(l.entries, *entries[i])
+		}
+	case index <= l.LastIndex():
+		//需要删除index和之后的日志，再append，并修改storage还有stabled的值
+		l.entries = l.entries[:index-l.dummyIndex-1]
+		for i := range entries {
+			l.entries = append(l.entries, *entries[i])
+		}
+		if index <= l.stabled {
+			//index..stabled...
+			//把[index,stabled]的日志也删掉了，需要更新stabled值
+			l.stabled = index - 1
 		}
 	}
-	// 在内存中找数据
-	if len := len(l.entries); len != 0 {
-		return l.entries[i-l.entries[0].Index].Term, nil
+
+}
+
+func (l *RaftLog) matchTerm(index uint64, term uint64) bool {
+	t, err := l.Term(index)
+	if err != nil {
+		return false
 	}
-	panic("please check the function")
-}
-func (l *RaftLog) getTerm(i uint64) uint64 {
-	res, _ := l.Term(i)
-	return res
+	return t == term
 }
 
-// 是否有数据要apply
-func (l *RaftLog) hasNextEnts() bool {
-	// entry has snapshot don't apply
-	off := max(l.applied+1, l.FirstIndex())
-	return l.committed >= off
+func (l *RaftLog) findConflictIndex(entries []*pb.Entry) {
+
 }
 
-//将ents append到log之后，如果ents[0].index位置有冲突，
-//应当将自身的entries从该位置截断，完整append ents
-func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
-	after := ents[0].Index
-	if len(l.entries) == 0 || after < l.entries[0].Index {
-		// The log is being truncated to before our current offset
-		// portion, so set the offset and replace the entries
-		l.stabled = after - 1
-		l.entries = ents
-	} else if after == l.entries[len(l.entries)-1].Index+1 {
-		// after is the next index in the u.entries
-		// directly append
-		l.entries = append(l.entries, ents...)
-	} else {
-		// truncate to after and copy to u.entries
-		// then append
-		//DPrintf("truncate the unstable entries before index %d", after)
-		l.entries = append([]pb.Entry{}, l.sliceInMemory(l.entries[0].Index, after-1)...)
-		l.stabled = min(l.stabled, after-1)
-		l.entries = append(l.entries, ents...)
+func (l *RaftLog) tryCommit(commit uint64, nowTerm uint64) bool {
+	// 获取commit对应地term值
+	term, err := l.Term(commit)
+	if err != nil {
+		return false
+	}
+	if commit > l.committed && term == nowTerm {
+		l.commitTo(commit)
+		return true
+	}
+	return false
+}
+
+func (l *RaftLog) commitTo(commit uint64) {
+	if l.committed < commit {
+		l.committed = min(l.LastIndex(), commit)
 	}
 }
 
-func (l *RaftLog) hasPendingSnapshot() bool {
-	// 暂时未使用
-	return !IsEmptySnap(l.pendingSnapshot)
-	//return false
-	//return l.unstable.snapshot != nil && !IsEmptySnap(*l.unstable.snapshot)
+func (l *RaftLog) commitedEntries() []pb.Entry {
+	//返回[l.applied+1:l.commited+1)的日志
+	return l.entries[l.applied-l.dummyIndex : l.committed-l.dummyIndex]
 }

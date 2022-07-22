@@ -16,6 +16,8 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
+
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -30,10 +32,6 @@ var ErrStepPeerNotFound = errors.New("raft: cannot step as peer not found")
 type SoftState struct {
 	Lead      uint64
 	RaftState StateType
-}
-
-func (ss *SoftState) equal(b *SoftState) bool {
-	return ss.Lead == b.Lead && ss.RaftState == b.RaftState
 }
 
 // Ready encapsulates the entries and messages that are ready to read,
@@ -73,21 +71,23 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
-	// 上一次Ready时的数据
-	prevSoftSt *SoftState
-	prevHardSt pb.HardState
+	lastSoftState *SoftState
+	lastHardState pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	r := newRaft(config)
-	rn := &RawNode{
-		Raft:       r,
-		prevSoftSt: r.softState(),
-		prevHardSt: r.hardState(),
+	node := &RawNode{
+		Raft: newRaft(config),
 	}
-	return rn, nil
+	node.lastSoftState = &SoftState{Lead: node.Raft.Lead, RaftState: node.Raft.State}
+	node.lastHardState = pb.HardState{
+		Term:   node.Raft.Term,
+		Vote:   node.Raft.Vote,
+		Commit: node.Raft.RaftLog.committed,
+	}
+	return node, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -155,47 +155,67 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	//DPrintf("[%v]--tryReady", rn.Raft.id)
-	r := rn.Raft
-	rd := Ready{
-		Entries:          r.RaftLog.unstableEntries(),
-		CommittedEntries: r.RaftLog.nextEnts(),
-		Messages:         r.msgs,
+
+	// SoftState will be nil if there is no update.
+	// HardState will be equal to empty state if there is no update.
+	ready := Ready{
+		Entries:          rn.Raft.RaftLog.unstableEntries(),
+		CommittedEntries: rn.Raft.RaftLog.commitedEntries(),
+		Messages:         rn.Raft.msgs,
 	}
 
-	if len(rd.Messages) == 0 {
-		rd.Messages = nil
+	nowSoftState := &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
+	nowHardState := pb.HardState{
+		Term:   rn.Raft.Term,
+		Vote:   rn.Raft.Vote,
+		Commit: rn.Raft.RaftLog.committed,
 	}
-	// raft消息丢失不影响
-	r.msgs = []pb.Message{}
+	if rn.lastSoftState != nil && rn.lastSoftState.RaftState == nowSoftState.RaftState && rn.lastSoftState.Lead == nowSoftState.Lead {
+		nowSoftState = nil
+	}
+	if !IsEmptyHardState(rn.lastHardState) && isHardStateEqual(nowHardState, rn.lastHardState) {
+		nowHardState = pb.HardState{}
+	}
+	ready.HardState = nowHardState
+	ready.SoftState = nowSoftState
 
-	if softSt := r.softState(); !softSt.equal(rn.prevSoftSt) {
-		rd.SoftState = softSt
+	ready.Messages = rn.Raft.msgs
+	rn.Raft.msgs = []pb.Message{}
+
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		ready.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	} else {
+		ready.Snapshot = pb.Snapshot{}
 	}
-	if hardSt := r.hardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardSt) {
-		rd.HardState = hardSt
-	}
-	if r.RaftLog.pendingSnapshot != nil {
-		rd.Snapshot = *r.RaftLog.pendingSnapshot
-		r.RaftLog.pendingSnapshot = nil
-	}
-	return rd
+
+	return ready
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
-	r := rn.Raft
-	if !r.softState().equal(rn.prevSoftSt) {
+	nowSoftState := &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
+	if rn.lastSoftState != nil && (rn.lastSoftState.RaftState != nowSoftState.RaftState || rn.lastSoftState.Lead != nowSoftState.Lead) {
 		return true
 	}
-	if hardSt := r.hardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardSt) {
+	nowHardState := pb.HardState{
+		Term:   rn.Raft.Term,
+		Vote:   rn.Raft.Vote,
+		Commit: rn.Raft.RaftLog.committed,
+	}
+	if !IsEmptyHardState(rn.lastHardState) && !isHardStateEqual(nowHardState, rn.lastHardState) {
 		return true
 	}
-	if r.RaftLog.hasPendingSnapshot() {
+	if len(rn.Raft.RaftLog.unstableEntries()) != 0 {
 		return true
 	}
-	if len(r.msgs) > 0 || len(r.RaftLog.unstableEntries()) > 0 || r.RaftLog.hasNextEnts() {
+	if len(rn.Raft.RaftLog.commitedEntries()) != 0 {
+		return true
+	}
+	if len(rn.Raft.msgs) > 0 {
+		return true
+	}
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
 		return true
 	}
 	return false
@@ -205,40 +225,28 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
-	//DPrintf("[%v]--tryAdvance", rn.Raft.id)
-	r := rn.Raft
+	log.Debugf("%d-%v will advance ready:%+v", rn.Raft.id, rn.Raft.State, rd)
 
-	// 更新prevSoftSt和prevHardSt
-	if rd.SoftState != nil {
-		rn.prevSoftSt = rd.SoftState
+	rn.lastSoftState = rd.SoftState
+	rn.lastHardState = rd.HardState
+	//这里主要是更新stabled、commited
+	if len(rd.Entries) > 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
-	if !IsEmptyHardState(rd.HardState) {
-		rn.prevHardSt = rd.HardState
+	if len(rd.CommittedEntries) > 0 {
+		log.Debugf("%d-%v update applied from %d to %d", rn.Raft.id, rn.Raft.State, rn.Raft.RaftLog.applied, rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
-
-	// 更新applyIndex
-	if rd.CommittedEntries != nil && len(rd.CommittedEntries) != 0 {
-		newApplyIndex := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
-		// 后面snapshot应该还要改
-		// 中途可能有snapshot更新了applyIndex
-		r.RaftLog.applied = max(r.RaftLog.applied, newApplyIndex)
+	if !IsEmptySnap(&rd.Snapshot) {
+		rn.Raft.RaftLog.pendingSnapshot = nil
 	}
-
-	// 更新raftLog.entry
-	if rd.Entries != nil && len(rd.Entries) != 0 {
-		lastStableEntry := rd.Entries[len(rd.Entries)-1]
-		if lastStableEntry.Index > r.RaftLog.stabled {
-			// 不在内存中删除
-			//tmpStableEntry := r.RaftLog.entries[lastStableEntry.Index-r.RaftLog.stabled-1]
-			//if tmpStableEntry.Term != lastStableEntry.Term || tmpStableEntry.Index != lastStableEntry.Index {
-			//	panic(fmt.Sprintf("[%v]--persistError,wantPeisist[term-%v,Index-%v],but[%v,%v]", r.id, lastStableEntry.Term, lastStableEntry.Index, tmpStableEntry.Term, tmpStableEntry.Index))
-			//}
-			//r.RaftLog.entries = r.RaftLog.entries[lastStableEntry.Index-r.RaftLog.stabled:]
-			r.RaftLog.stabled = lastStableEntry.Index
-		}
-	}
-	//每次peerStorage中删了Log，Memory中也要删除
+	index1 := rn.Raft.RaftLog.firstIndex()
 	rn.Raft.RaftLog.maybeCompact()
+	index2 := rn.Raft.RaftLog.firstIndex()
+	if index1 != index2 {
+		log.Debugf("%d-%v raftLog compact from %d to %d", rn.Raft.id, rn.Raft.State, index1-1, index2-1)
+	}
+	log.Debugf("%d-%v after advance: raftLog=%v", rn.Raft.id, rn.Raft.State, rn.Raft.RaftLog)
 }
 
 // GetProgress return the Progress of this node and its peers, if this

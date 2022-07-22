@@ -16,9 +16,7 @@ package raft
 
 import (
 	"errors"
-	"fmt"
-	//"github.com/pingcap-incubator/tinykv/kv/raftstore"
-	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"sort"
 )
@@ -40,6 +38,8 @@ var stmap = [...]string{
 	"StateCandidate",
 	"StateLeader",
 }
+
+var debug = false
 
 func (st StateType) String() string {
 	return stmap[uint64(st)]
@@ -119,7 +119,7 @@ type Raft struct {
 	// the log
 	RaftLog *RaftLog
 
-	// log replication progress of each peers
+	// log replication progress of each peers  ->
 	Prs map[uint64]*Progress
 
 	// this peer's role
@@ -137,8 +137,7 @@ type Raft struct {
 	// heartbeat interval, should send
 	heartbeatTimeout int
 	// baseline of election interval
-	electionTimeout       int
-	randomElectionTimeout int
+	electionTimeout int
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
@@ -161,31 +160,9 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
-}
 
-// 读取持久化数据
-func (r *Raft) loadHardState(state pb.HardState) {
-	if state.Commit < r.RaftLog.committed || state.Commit > r.RaftLog.LastIndex() {
-		panic(fmt.Sprintf("[%v]--state.commit[%d]-- is out of range [%d, %d]", r.id, state.Commit, r.RaftLog.committed, r.RaftLog.LastIndex()))
-	}
-	r.RaftLog.committed = state.Commit
-	r.Term = state.Term
-	r.Vote = state.Vote
-}
-
-func (r *Raft) softState() *SoftState {
-	return &SoftState{
-		Lead:      r.Lead,
-		RaftState: r.State,
-	}
-}
-
-func (r *Raft) hardState() pb.HardState {
-	return pb.HardState{
-		Term:   r.Term,
-		Vote:   r.Vote,
-		Commit: r.RaftLog.committed,
-	}
+	randomElectionTimeout int
+	logger                *log.Logger
 }
 
 // newRaft return a raft peer with the given config
@@ -199,863 +176,601 @@ func newRaft(c *Config) *Raft {
 	if err != nil {
 		panic(err)
 	}
-
+	peers := c.peers
+	if len(confState.Nodes) > 0 {
+		peers = confState.Nodes
+	}
+	//log.Debugf("%d want to new log", c.ID)
 	raftLog := newLog(c.Storage)
-	r := &Raft{
-		id:      c.ID,
-		Term:    0,
-		Vote:    None,
-		RaftLog: raftLog,
-		Prs:     make(map[uint64]*Progress, 0),
-
-		msgs: make([]pb.Message, 0),
-
-		heartbeatTimeout: c.HeartbeatTick,
+	//log.Debugf("%d new log success", c.ID)
+	term, _ := c.Storage.Term(raftLog.firstIndex() - 1)
+	raftLog.dummyTerm = term
+	raft := &Raft{
+		id:               c.ID,
+		Lead:             None,
+		Prs:              make(map[uint64]*Progress),
+		RaftLog:          raftLog,
 		electionTimeout:  c.ElectionTick,
-		heartbeatElapsed: 0,
-		electionElapsed:  0,
-		leadTransferee:   0,
-		PendingConfIndex: 0,
+		heartbeatTimeout: c.HeartbeatTick,
+		logger:           log.New(),
+	}
+	if debug {
+		raft.logger.SetLevel(log.LOG_LEVEL_DEBUG)
 	}
 
-	// 上层传节点数据时实际上是在peerStorage中，但2A的测试中是在config中传过来的
-	if confState.Nodes == nil {
-		for _, peer := range c.peers {
-			r.Prs[peer] = &Progress{}
-		}
-	} else {
-		for _, peer := range confState.Nodes {
-			r.Prs[peer] = &Progress{}
-		}
+	for _, peer := range peers { //这里有点问题，restart时peer是空的，应该从ConfState中拿--------->已修复
+		raft.Prs[peer] = &Progress{Next: 1, Match: 0}
 	}
 
-	r.becomeFollower(r.Term, None)
 	if !IsEmptyHardState(hardState) {
-		r.loadHardState(hardState)
-	}
-
-	// 可能上层会直接告诉你已经apply到哪个位置了
-	if c.Applied <= raftLog.committed && c.Applied >= raftLog.applied {
-		raftLog.applied = c.Applied
-	} else if c.Applied != 0 {
-		panic(fmt.Sprintf("[%v]--c.applied[%d]-- is out of range [prevApplied(%d), committed(%d)]", r.id, c.Applied, raftLog.applied, raftLog.committed))
-	}
-
-	DPrintf("[%v]--init--:Server--Term-%v-lastApplied-%v-commitIndex-%v\n\n", r.id, r.Term, r.RaftLog.applied, r.RaftLog.committed)
-	return r
-}
-
-// 将消息放入队列
-func (r *Raft) send(m pb.Message) {
-	r.msgs = append(r.msgs, m)
-}
-
-// 发送snapshot
-func (r *Raft) dealSnapshot(to uint64) {
-	// pendingSnapshot为接收到的snapshot，会通过Ready往上传，如果还有的话说明此时snapshot应该是它
-	m := pb.Message{
-		MsgType: pb.MessageType_MsgSnapshot,
-		To:      to,
-		From:    r.id,
-		Term:    r.Term,
-	}
-
-	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
-		m.Snapshot = r.RaftLog.pendingSnapshot
-	} else {
-		var err error = nil
-		tmp := pb.Snapshot{}
-		tmp, err = r.RaftLog.storage.Snapshot()
-		m.Snapshot = &tmp
-		// 初次请求开始生成snapshot，等生成以后再同步
-		if err != nil {
-			return
+		if hardState.Commit < raft.RaftLog.committed || hardState.Commit > raft.RaftLog.LastIndex() {
+			log.Panicf("%x state.commit %d is out of range [%d, %d]", raft.id, hardState.Commit, raft.RaftLog.committed, raft.RaftLog.LastIndex())
 		}
+		raft.Term = hardState.Term
+		raft.Vote = hardState.Vote
+		raft.RaftLog.committed = hardState.Commit
 	}
-	engine_util.DPrintf("RID[%v] -- Send[snapshot](snapIndex,snapTerm) -- entry-[%v,%v],to-%v,next-%v,fistIndex-%v", r.id, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term, to, r.Prs[to].Next, r.RaftLog.FirstIndex())
 
-	r.send(m)
-	// 没有snapshot的response，直接修改NextIndex，就算失败后面也会重新匹配NextIndex
-	r.Prs[to].Next = m.Snapshot.Metadata.Index + 1
+	if c.Applied > 0 {
+		raft.RaftLog.appliedTo(c.Applied)
+	}
+	raft.becomeFollower(raft.Term, None)
+
+	return raft
 }
 
-func (r *Raft) dealReplication(to uint64) {
-	m := pb.Message{
-		MsgType: pb.MessageType_MsgAppend,
-		To:      to,
-		From:    r.id,
-		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
-	}
-	pr := r.Prs[to]
-
-	//需要发送的所有entry
-	lastIndex := r.RaftLog.LastIndex()
-	if lastIndex >= pr.Next {
-		//DPrintf("[%v] -- pengdingSnap-%v,l-%v,r-%v,firstIndex-%v,entry-%v", r.id, r.RaftLog.pendingSnapshot, pr.Next, r.RaftLog.LastIndex(), r.RaftLog.FirstIndex(), r.RaftLog.entries)
-		tmpEntries, _ := r.RaftLog.sliceInAll(pr.Next, r.RaftLog.LastIndex())
-		for i, _ := range tmpEntries {
-			// 记住取不同位置的指针要用tmpEntries[i]，而不是_,entry = ...，否则实际上是同一个地址
-			m.Entries = append(m.Entries, &tmpEntries[i])
-		}
-	}
-	// 就算没新数据，preLogIndex应该也是最后一个Log的Index
-	m.Index = pr.Next - 1
-	m.LogTerm, _ = r.RaftLog.Term(m.Index)
-
-	DPrintf("[%v] -- Send[AERequest](preIndex,preTerm) -- entry-[%v,%v],to-%v,next-%v,lastIndex-%v", r.id, m.Index, m.LogTerm, to, r.Prs[to].Next, lastIndex)
-
-	r.send(m)
-}
-
-// sendAppend sends an append RPC with new entries (if any) and the
+// sendAppend sends an truncateAndAppend RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	p := r.Prs[to]
-	// 无entries发送
-	//if r.RaftLog.LastIndex() < p.Next {
-	//	return false
-	//}
-	if p.Next < r.RaftLog.FirstIndex() {
-		//已经snapshot了
-		r.dealSnapshot(to)
+	m := pb.Message{}
+	nextIndex := r.Prs[to].Next
+	m.To = to
+	term, errt := r.RaftLog.Term(nextIndex - 1)
+
+	if errt != nil {
+		//Snapshot
+		m.MsgType = pb.MessageType_MsgSnapshot
+		m.Term = r.Term
+
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				r.logger.Debugf("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				return false
+			}
+			panic(err)
+		}
+		r.logger.Infof("%x send snapshot to %x", r.id, to)
+		m.Snapshot = &snapshot
+		r.Prs[to].Next = snapshot.Metadata.Index + 1
 	} else {
-		r.dealReplication(to)
+		//AppendEntries操作
+		m.MsgType = pb.MessageType_MsgAppend
+		m.Term = r.Term
+		m.LogTerm = term
+		m.Index = nextIndex - 1 //prevLogIndex=nextIndex-1
+
+		var entries []*pb.Entry
+		for i := nextIndex; i <= r.RaftLog.LastIndex(); i++ {
+			entries = append(entries, &r.RaftLog.entries[i-r.RaftLog.firstIndex()])
+		}
+		m.Entries = entries
+		m.Commit = r.RaftLog.committed
+		//log.Infof("%x send append msg to %d , nextIndex=%v", r.id, to, nextIndex)
 	}
+	r.send(m)
 	return false
+}
+
+func (r *Raft) GetId() uint64 {
+	return r.id
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	m := pb.Message{
-		MsgType: pb.MessageType_MsgHeartbeat,
-		From:    r.id,
-		To:      to,
-		Term:    r.Term,
-		// 通过心跳同步commit时只能匹配到match对应位置
-		Commit: min(r.Prs[to].Match, r.RaftLog.committed),
-	}
-	r.send(m)
-}
-
-// Leader Transfer，触发超时选举
-func (r *Raft) sendTimeout(to uint64) {
-	DPrintf("[%v]--Begin Transfer Leader--:term-%v,to-%v,myCommitted-%v,match-%v", r.id, r.Term, to, r.RaftLog.committed, r.Prs[to].Match)
-	r.send(pb.Message{
-		MsgType: pb.MessageType_MsgTimeoutNow,
-		To:      to,
-		From:    r.id,
-		// confChange在两节点时保证了Transfer一定成功被Follow接收，需要更新commit
-		//Commit: min(r.Prs[to].Match, r.RaftLog.committed),
-	})
-}
-
-// 广播append消息
-func (r *Raft) broadcastAppend() {
-	for to := range r.Prs {
-		if to != r.id {
-			r.sendAppend(to)
-		}
-	}
-}
-
-// 广播append消息
-func (r *Raft) broadcastHeartBeat() {
-	for to := range r.Prs {
-		if to != r.id {
-			r.sendHeartbeat(to)
-		}
-	}
-}
-
-// 广播append消息
-func (r *Raft) broadcastVote() {
-	r.becomeCandidate()
-	m := pb.Message{
-		MsgType: pb.MessageType_MsgRequestVote,
-		From:    r.id,
-		Term:    r.Term,
-		Index:   r.RaftLog.LastIndex(),
-	}
-	m.LogTerm, _ = r.RaftLog.Term(m.Index)
-
-	for to := range r.Prs {
-		if to != r.id {
-			m.To = to
-			r.send(m)
-		}
-	}
-
-	// 单节点直接选举成功
-	if len(r.Prs) == 1 {
-		r.becomeLeader()
-		r.broadcastHeartBeat()
-	}
+	// 通过心跳同步commit时最多只能匹配到match对应位置
+	r.send(pb.Message{To: to, Term: r.Term, MsgType: pb.MessageType_MsgHeartbeat, Commit: min(r.Prs[to].Match, r.RaftLog.committed)})
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
-	if r.State == StateLeader {
-		r.heartbeatElapsed++
-		// Leader超时处理
-		if r.heartbeatElapsed >= r.heartbeatTimeout {
-			r.heartbeatElapsed = 0
-			r.Step(pb.Message{
-				MsgType: pb.MessageType_MsgBeat,
-				To:      r.id,
-				From:    r.id,
-			})
-			DPrintf("[%v]--doHeartBeat--:begin to send HeartBeat-Term-%v", r.id, r.Term)
-		}
-		// transferee超时取消
-		//if r.leadTransferee != None {
-		//	r.electionElapsed++
-		//	if r.electionElapsed >= r.electionTimeout {
-		//		r.leadTransferee = None
-		//	}
-		//}
-	} else {
-		r.electionElapsed++
-		// Follow,Candidate超时处理
-		if r.electionElapsed >= r.randomElectionTimeout {
-			r.electionElapsed = 0
-			r.Step(pb.Message{
-				MsgType: pb.MessageType_MsgHup,
-				To:      r.id,
-				From:    r.id,
-			})
-		}
-	}
-}
+	switch r.State {
+	case StateFollower, StateCandidate:
+		r.tickElection()
 
-func (r *Raft) resetRandomElectionTime() {
-	//DPrintf("\n%v\n", r.electionTimeout)
-	r.randomElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
-}
-func (r *Raft) resetTerm(term uint64) {
-	r.Term = term
-	r.Vote = None
-	r.Lead = None
-	r.electionElapsed = 0
-	r.heartbeatElapsed = 0
-	r.leadTransferee = None
-	r.resetRandomElectionTime()
+	case StateLeader:
+		r.tickHeartBeat()
+
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
-	r.resetTerm(term)
-	r.State = StateFollower
+	r.reset(term)
 	r.Lead = lead
-
-	DPrintf("[%v]--init--:Follower--[Term-%v,Lead-%v]", r.id, r.Term, r.Lead)
+	r.State = StateFollower
+	if r.leadTransferee != 0 {
+		//重置leadTransferee
+		r.leadTransferee = 0
+	}
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
-	r.resetTerm(r.Term + 1)
-	r.State = StateCandidate
+	r.reset(r.Term + 1)
+	//投给自己
 	r.Vote = r.id
-	r.votes = make(map[uint64]bool)
-	r.votes[r.id] = true
-	DPrintf("[%v]--init--:Candidate--[Term-%v,Lead-%v,commit-%v]，prs-%v", r.id, r.Term, r.Lead, r.RaftLog.committed, r.Prs)
-
+	r.State = StateCandidate
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
-	// NOTE: Leader should propose a noop entry on its term
-	r.resetTerm(r.Term)
-	r.State = StateLeader
+	r.reset(r.Term)
 	r.Lead = r.id
+	r.State = StateLeader
+	// NOTE: Leader should propose a noop entry on its term
+	//log.Debugf("%x become leader at term %+v", r.id, r.Term)
+	//log.Infof("%x become leader at term %+v", r.id, r.Term)
 
-	lastIndex := r.RaftLog.LastIndex()
-	for peer := range r.Prs {
-		r.Prs[peer].Next = lastIndex + 1
-		r.Prs[peer].Match = 0
-	}
-	DPrintf("[%v]--init--:Leader--[Term-%v,Lead-%v]\n\n", r.id, r.Term, r.Lead)
-
-	// append一条空消息
-	//使用新配置进行成员变更日志同步：
-	// no-op不仅能避免幽灵复现问题，还能保证单节点配置变更中前任变更节点与该日志的commit节点有交集，阻止上任重新当选Leader使用不同配置产生脑裂
-	// 只有该no-op提交后才能开始新的节点变更，可参考https://zhuanlan.zhihu.com/p/359206808
-	// 这里是用的老配置进行同步，日志提交后才变更节点，没有这个问题
-	r.appendEntry(&pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1})
-	r.broadcastAppend()
-}
-
-// append新的日志条目
-func (r *Raft) appendEntry(entries ...*pb.Entry) {
-	lastIndex := r.RaftLog.LastIndex()
-
-	// cnt记录添加成功的entry个数
-	var cnt uint64 = 0
-	hasConfChange := false
-	for i := range entries {
-		//需要判断是否可以config change
-		//重复消息没有影响
-		if entries[i].EntryType == pb.EntryType_EntryConfChange {
-			if r.RaftLog.applied < r.PendingConfIndex {
-				continue
-			}
-			hasConfChange = true
-			r.PendingConfIndex = lastIndex + cnt + 1
-		}
-		cnt++
-		entries[i].Term = r.Term
-		entries[i].Index = lastIndex + cnt
-		r.RaftLog.entries = append(r.RaftLog.entries, *entries[i])
-		if hasConfChange {
-			DPrintf("[%v]--AcceptConfigChange--:new entry at Index-%v Term-%v,entry-%v", r.id, entries[i].Index, entries[i].Term, entries[i])
-		}
-	}
-	r.Prs[r.id].Match = lastIndex + cnt
-	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
-	if len(r.Prs) == 1 {
-		r.updateCommitIndexL()
-	}
-	if !hasConfChange && cnt >= 1 {
-		DPrintf("[%v]--AcceptCommand--:new entry at Index-[%v,%v] Term-%v", r.id, lastIndex+1, lastIndex+cnt, r.Term)
-	}
-}
-
-// 处理Leader消息
-func (r *Raft) stepLeader(m *pb.Message) error {
-	switch m.MsgType {
-	// 收到新entry
-	case pb.MessageType_MsgPropose:
-		if r.leadTransferee != None {
-			DPrintf("[%v]--rejectPropose--:doing Transfer-term-%v,to-%v", r.id, r.Term, r.leadTransferee)
-			return ErrProposalDropped
-		}
-		if m.Entries != nil && len(m.Entries) != 0 {
-			r.appendEntry(m.Entries...)
-		}
-		r.broadcastAppend()
-
-	// Leader Transfer，更改Leader，期间不propose新的日志
-	case pb.MessageType_MsgTransferLeader:
-		transferee := m.From
-		//会有重发操作
-		//if r.leadTransferee == transferee {
-		//	DPrintf("[%v]--Ignore Transfer--:same transfer-term-%v,to-%v", r.id, r.Term, transferee)
-		//	return nil
-		//}
-		if transferee == r.id {
-			DPrintf("[%v]--Ignore Transfer--:leader is self-term-%v,to-%v", r.id, r.Term, transferee)
-			return nil
-		}
-		if _, ok := r.Prs[transferee]; !ok {
-			DPrintf("[%v]--Ignore Transfer--:transferee Not exist-term-%v,to-%v", r.id, r.Term, transferee)
-			return nil
-		}
-		// 在electionTimeout内需要完成transfer，暂时不用
-		//r.electionElapsed = 0
-		r.leadTransferee = transferee
-		if r.Prs[transferee].Match == r.RaftLog.LastIndex() {
-			r.sendTimeout(transferee)
-		} else {
-			DPrintf("[%v]--Later Transfer Leader，begin send append--:term-%v,to-%v", r.id, r.Term, transferee)
-			r.sendAppend(transferee)
-		}
-
-	// 发送心跳
-	case pb.MessageType_MsgBeat:
-		r.broadcastHeartBeat()
-
-	// 处理心跳response
-	case pb.MessageType_MsgHeartbeatResponse:
-		if r.Term >= m.Term {
-			pr := r.Prs[m.From]
-			if r.leadTransferee == None && r.RaftLog.LastIndex() > pr.Match {
-				r.sendAppend(m.From)
-			} else if r.leadTransferee != None {
-				// 因为有可能发了snapshot，导致transfer Leader无法确定是否append Entry成功，尝试重新执行Transfer Leader
-				r.Step(pb.Message{
-					MsgType: pb.MessageType_MsgTransferLeader,
-					To:      r.id,
-					From:    r.leadTransferee,
-				})
-			}
-		}
-
-	// 处理AppendEntry response
-	case pb.MessageType_MsgAppendResponse:
-		pr := r.Prs[m.From]
-
-		if m.Reject {
-			DPrintf("[%v]--AE_Response--ConflictAndNewNext--:To [%v],myTerm-%v,oldNext-%v,newNext-%v", r.id, m.From, r.Term, pr.Next, m.Index)
-			// 更新nextIndex寻找最大共识
-			pr.Next = m.Index
-			// 消息重发
-			r.sendAppend(m.From)
-			return nil
-		}
-
-		//更新matchIndex
-		nxtMatchIndex := m.Index
-		if nxtMatchIndex == pr.Match {
-			DPrintf("[%v]--AE_Response--Ignore-:success append to [%v]", r.id, m.From)
-		} else if nxtMatchIndex < pr.Match {
-			DPrintf("[%v]--AE_Response--Ignore-:old response to [%v]", r.id, m.From)
-		} else {
-			pr.Match = nxtMatchIndex
-			pr.Next = nxtMatchIndex + 1
-			DPrintf("[%v]--AE_Response--UpdateMatch-%v--:success append to [%v],myTerm_%v", r.id, nxtMatchIndex, m.From, r.Term)
-			r.updateCommitIndexL()
-		}
-		if m.From == r.leadTransferee && r.Prs[r.leadTransferee].Match == r.RaftLog.LastIndex() {
-			r.sendTimeout(r.leadTransferee)
-		}
-	}
-
-	return nil
-}
-
-// 处理Leader消息
-func (r *Raft) stepFollow(m *pb.Message) error {
-	switch m.MsgType {
-	// 转发Leader Transfer
-	case pb.MessageType_MsgTransferLeader:
-		if r.Lead == None {
-			DPrintf("[%v]--no leader at term-%v,Follow drop Transfer", r.id, r.Term)
-			return nil
-		}
-		m.To = r.Lead
-		r.send(*m)
-	// 收到Leader Transfer发来的MsgTimeoutNow
-	case pb.MessageType_MsgTimeoutNow:
-		//通过Transfer更新commitIndex
-		//DPrintf("[%v]--FollowTimeout--:msgCommit-%v,Term-%v", r.id, m.Commit, r.Term)
-		//if m.Term >= r.Term {
-		//	if m.Commit > r.RaftLog.committed {
-		//		//nxtCommitMax := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
-		//		nxtCommit := min(m.Commit, r.RaftLog.LastIndex())
-		//		DPrintf("[%v]--FollowReceiveTimeout--UpdateCommit--:commitIndex-%v,nxtCommitMax-%v,Term-%v", r.id, r.RaftLog.committed, nxtCommit, r.Term)
-		//		r.RaftLog.committed = nxtCommit
-		//	}
-		//}
-
-		r.electionElapsed = 0
-		r.Step(
-			pb.Message{
-				MsgType: pb.MessageType_MsgHup,
-				To:      r.id,
-				From:    r.id,
-			})
-	// 发送Vote
-	case pb.MessageType_MsgHup:
-		r.broadcastVote()
-	// 收到新entry，转发给Leader
-	case pb.MessageType_MsgPropose:
-		{
-			if r.Lead == None {
-				DPrintf("[%v]--no leader at term-%v,Follow drop Propose", r.id, r.Term)
-				return ErrProposalDropped
-			}
-			m.To = r.Lead
-			r.send(*m)
-		}
-	}
-
-	return nil
-}
-
-// 处理Candidate消息
-func (r *Raft) stepCandidate(m *pb.Message) error {
-	switch m.MsgType {
-	// 转发Leader Transfer
-	case pb.MessageType_MsgTransferLeader:
-		DPrintf("[%v]--no leader at term-%v,Candidate drop Transfer", r.id, r.Term)
-		return nil
-	// 收到新entry，转发给Leader
-	case pb.MessageType_MsgPropose:
-		DPrintf("[%v]--no leader at term-%v,Candidate drop Propose", r.id, r.Term)
-		return ErrProposalDropped
-	// 收到Leader Transfer发来的MsgTimeoutNow
-	//case pb.MessageType_MsgTimeoutNow:
-	//	//通过Transfer更新commitIndex
-	//	if m.Term >= r.Term {
-	//		if m.Commit > r.RaftLog.committed {
-	//			//nxtCommitMax := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
-	//			nxtCommit := min(m.Commit, r.RaftLog.LastIndex())
-	//			DPrintf("[%v]--CandidateReceiveTimeout--UpdateCommit--:commitIndex-%v,nxtCommitMax-%v,Term-%v", r.id, r.RaftLog.committed, nxtCommit, r.Term)
-	//			r.RaftLog.committed = nxtCommit
-	//		}
-	//	}
-	// 发送Vote
-	case pb.MessageType_MsgHup:
-		r.broadcastVote()
-	// 处理Vote Response
-	case pb.MessageType_MsgRequestVoteResponse:
-		// 老Term的投票结果无用，超时时新Term会重置votes
-		if m.Term == r.Term {
-			r.votes[m.From] = !m.Reject
-			if !m.Reject {
-				DPrintf("[%v]--Vote_Response--:getVote from [%v]", r.id, m.From)
-			} else {
-				DPrintf("[%v]--Vote_Response--:rejectVote from [%v]", r.id, m.From)
-			}
-			voteCnt := 0
-			finishCnt := len(r.votes)
-			for _, res := range r.votes {
-				if res {
-					voteCnt++
-				}
-			}
-
-			if voteCnt >= len(r.Prs)/2+1 {
-				// 选举成功
-				r.becomeLeader()
-				//r.broadcastHeartBeat()
-			} else if finishCnt >= len(r.Prs) {
-				// 选举失败
-				DPrintf("[%v]--RoleChange--:Vote Failed", r.id)
-				r.becomeFollower(r.Term, None)
-			}
-		}
-	}
-	return nil
+	r.appendEntry(&pb.Entry{Data: nil})
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	// 节点初次addNode创建无Prs，需要snapshot复制过来
-	//if _, ok := r.Prs[r.id]; !ok {
-	//	DPrintf("[%v]--Step Fail--node not exist,term-%v", r.id, r.Term)
-	//	return nil
-	//}
-	// 来了term大的，转follow
-	if m.Term > r.Term {
-		DPrintf("[%v]--RoleChange--:get Message more Term from Peer-%v--", r.id, m.From)
-		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgSnapshot {
+	//r.logger.Infof("%x step msg %+v", r.id, m)
+
+	//检查term
+	switch {
+	case m.Term == 0:
+		//本地消息
+	case m.Term > r.Term:
+		//收到具有更大Term的消息
+		if m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgSnapshot {
+			//已经有新Leader了，发送来心跳或者AE或者snapshot
 			r.becomeFollower(m.Term, m.From)
 		} else {
+			//有新的Candidate来请求投票了
 			r.becomeFollower(m.Term, None)
 		}
-		// 投票需要Term一样
-		if m.MsgType == pb.MessageType_MsgRequestVoteResponse {
-			return nil
+	case m.Term < r.Term:
+		//收到更小Term的消息,回复
+		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat {
+			r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse})
 		}
-	} else if m.Term == r.Term && r.State == StateCandidate {
-		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgSnapshot {
-			r.becomeFollower(m.Term, m.From)
-			DPrintf("[%v]--RoleChange--:get Message more Term from Peer-%v--", r.id, m.From)
-		}
-	}
-	// 所有State都需要处理的消息
-	switch m.MsgType {
-	// 处理Vote Request
-	case pb.MessageType_MsgRequestVote:
-		r.handleVote(&m)
-	// 处理心跳request
-	case pb.MessageType_MsgHeartbeat:
-		r.handleHeartbeat(&m)
-	// 处理Append request
-	case pb.MessageType_MsgAppend:
-		r.handleAppendEntries(m)
-	// 处理snapshot
-	case pb.MessageType_MsgSnapshot:
-		r.handleSnapshot(m)
+		return nil
 	}
 
-	// 节点状态改变
-	switch r.State {
-	case StateFollower:
-		return r.stepFollow(&m)
-	case StateCandidate:
-		return r.stepCandidate(&m)
-	case StateLeader:
-		return r.stepLeader(&m)
+	//处理HUP、Vote信息，即follower、candidate、leader都可以进行该判断
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		//收到tickElection超时后触发的Hup消息，开始一轮选举
+		if r.State != StateLeader {
+			//r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
+			r.startElection()
+		} else {
+			r.logger.Debugf("%x ignoring MsgHup because already leader", r.id)
+		}
+
+	case pb.MessageType_MsgRequestVote:
+		//在m.Term > r.Term中已经处理了，不会再出现该情况，在这里只会两者相等
+		canVote := (r.Vote == None || r.Vote == m.From) &&
+			(r.RaftLog.LastTerm() < m.LogTerm || (r.RaftLog.LastTerm() == m.LogTerm && r.RaftLog.LastIndex() <= m.Index))
+		if canVote {
+			r.send(pb.Message{To: m.From, Term: m.Term, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: false})
+			r.electionElapsed = 0
+			r.Vote = m.From
+		} else {
+			r.send(pb.Message{To: m.From, Term: m.Term, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true})
+		}
+
+	default:
+		//其他消息，根据状态进行处理
+		switch r.State {
+		case StateFollower:
+			r.stepFollower(m)
+		case StateCandidate:
+			r.stepCandidate(m)
+		case StateLeader:
+			r.stepLeader(m)
+		}
 	}
 	return nil
-}
-
-// 当Leader的marchIndex更新时，尝试更新commitIndex
-func (r *Raft) updateCommitIndexL() {
-	//Leader更新commitIndex
-	var tmp = make([]int, len(r.Prs))
-	// Prs的Key不一定连续
-	cnt := 0
-	for _, progress := range r.Prs {
-		tmp[cnt] = int(progress.Match)
-		cnt++
-	}
-	//tmp[r.id-1] = int(r.RaftLog.LastIndex())
-	sort.Ints(tmp)
-	nxtCommitMax := uint64(tmp[(len(r.Prs)-1)/2])
-
-	//DPrintf("[%v]--matchIndex-%v,nxtCommitMax-%v,Index0-%v\n\n", rf.me, rf.matchIndex, nxtCommitMax, rf.log.getIndexIndexL(0))
-	//一定要先判断commitIndex是不是小些,因为它初始化比现有的snapshotIndex大,否则可能数组越界
-	if nxtCommitMax >= r.RaftLog.committed && r.RaftLog.getTerm(nxtCommitMax) == r.Term {
-		//更新commmit
-		if r.RaftLog.committed == nxtCommitMax {
-			//DPrintf("[%v]--AE_True--UpdateCommit--Same:commitIndex-%v,nxtCommitMax-%v", r.id, r.RaftLog.committed, nxtCommitMax)
-		} else {
-			DPrintf("[%v]--AE_True--UpdateCommit--Success:commitIndex-%v,nxtCommitMax-%v", r.id, r.RaftLog.committed, nxtCommitMax)
-			r.RaftLog.committed = nxtCommitMax
-			r.broadcastAppend()
-		}
-	} else {
-		if nxtCommitMax < r.RaftLog.committed {
-			//DPrintf("[%v]--AE_True--UpdateCommit--CommitLittle--:commitIndex-%v,nxtCommitMax-%v", r.id, r.RaftLog.committed, nxtCommitMax)
-		} else {
-			//DPrintf("[%v]--AE_True--UpdateCommit--TermLittle--:commitIndex-%v,nxtCommitMax-%v,nxtCommitTerm-%v,cureentTerm-%v", r.id, r.RaftLog.committed, nxtCommitMax, r.RaftLog.getTerm(nxtCommitMax), r.Term)
-		}
-	}
-}
-
-// 处理Vote Request
-func (r *Raft) handleVote(m *pb.Message) {
-	// 获得最后log
-	lastLogIndex := r.RaftLog.LastIndex()
-	lastLogTerm, _ := r.RaftLog.Term(lastLogIndex)
-
-	mRes := pb.Message{
-		MsgType: pb.MessageType_MsgRequestVoteResponse,
-		To:      m.From,
-		From:    r.id,
-		Term:    r.Term,
-	}
-	//判断是否需要投票
-	if m.Term >= r.Term && (r.Vote == None || r.Vote == m.From) &&
-		(m.LogTerm > lastLogTerm || (m.LogTerm == lastLogTerm && m.Index >= lastLogIndex)) {
-		r.Term = m.Term
-		r.Vote = m.From
-		r.Lead = None
-		r.electionElapsed = 0
-		mRes.Reject = false
-	} else {
-		mRes.Reject = true
-	}
-	r.send(mRes)
-}
-
-// handleHeartbeat handle Heartbeat RPC request
-func (r *Raft) handleHeartbeat(m *pb.Message) {
-	// Your Code Here (2A).
-	mRes := pb.Message{
-		MsgType: pb.MessageType_MsgHeartbeatResponse,
-		To:      m.From,
-		From:    r.id,
-		Term:    r.Term,
-	}
-	if m.Term >= r.Term {
-		if m.Commit > r.RaftLog.committed {
-			//nxtCommitMax := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
-			nxtCommit := min(m.Commit, r.RaftLog.LastIndex())
-			DPrintf("[%v]--HB_Request--UpdateCommit--:commitIndex-%v,nxtCommitMax-%v,Term-%v", r.id, r.RaftLog.committed, nxtCommit, r.Term)
-			r.RaftLog.committed = nxtCommit
-		} else {
-			DPrintf("[%v]--HB_Request--:Term-%v", r.id, r.Term)
-		}
-		r.electionElapsed = 0
-		r.Lead = m.From
-	}
-	r.send(mRes)
 }
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	mRes := pb.Message{
-		MsgType: pb.MessageType_MsgAppendResponse,
-		To:      m.From,
-		From:    r.id,
-		Term:    r.Term,
-		Index:   0,
-		LogTerm: None,
-		Reject:  false,
-	}
-	if m.Term < r.Term {
-		r.send(mRes)
-		return
-	}
-	r.electionElapsed = 0
-	r.Lead = m.From
-
-	// 过时消息
-	if m.Index < r.RaftLog.committed {
-		mRes.Index = r.RaftLog.committed
-		mRes.LogTerm = 1
-		r.send(mRes)
-		return
-	}
-
-	// 更新Log
-	lastLogIndex := r.RaftLog.LastIndex()
-	firstLogIndex := r.RaftLog.FirstIndex()
-
-	//Reply false if log doesn’t contain an entry at prevLogIndex
-	//whose term matches prevLogTerm
-
-	if lastLogIndex < m.Index {
-		// preLogIndex超出长度
-		mRes.Index = lastLogIndex + 1
-		mRes.Reject = true
-		DPrintf("[%v]--AE_Request--conflict--LackEntry--:To [%v],myTerm-%v,LeaderTerm-%v,LastIndex-%v,PrevLogIndex-%v", m.From, r.id, r.Term, m.Term, lastLogIndex, m.Index)
-
-		r.send(mRes)
-		return
-	}
-	myPreTerm, _ := r.RaftLog.Term(m.Index)
-	if myPreTerm != m.LogTerm {
-		// preLogIndex处Term冲突
-		mRes.Index = m.Index
-		mRes.Reject = true
-		// 既然myPreTerm和LeaderPreTerm不同，可以直接往前匹配整个myPreTerm算作冲突，减少通信次数
-		// 注意此时mRes是Uint64的，0-1会死循环
-		for mRes.Index != 0 && mRes.Index-1 >= firstLogIndex {
-			nxtTerm, _ := r.RaftLog.Term(mRes.Index - 1)
-			if nxtTerm == myPreTerm {
-				mRes.Index--
-			} else {
+	response := pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Term: r.Term}
+	lastNew := uint64(0) //返回append操作后最新的index给leader更新
+	if r.RaftLog.matchTerm(m.Index, m.LogTerm) {
+		lastNew = m.Index + uint64(len(m.Entries)) //prevLogIndex+len(entries)
+		//搜索矛盾点
+		var conflictIndex uint64
+		for _, entry := range m.Entries {
+			if !r.RaftLog.matchTerm(entry.Index, entry.Term) {
+				conflictIndex = entry.Index
 				break
 			}
 		}
-		DPrintf("[%v]--AE_Request--conflict--ConflictEntry--:To [%v],myTerm-%v,LeaderTerm-%v,preLogIndex-%v,myPreLogTerm-%v,leaderPreLogTerm-%v,nextIndex-%v", m.From, r.id, r.Term, m.Index, m.Term, myPreTerm, m.LogTerm, mRes.Index)
-
-		r.send(mRes)
-		return
-	}
-
-	//If an existing entry conflicts with a new one (same index
-	//but different terms), delete the existing entry and all that
-	//follow it
-	//Append any new entries not already in the log
-	// 有发空的AppendEntries
-	if m.Entries == nil || len(m.Entries) == 0 {
-		mRes.Index = m.Index
-	} else {
-		mRes.Index = m.Entries[len(m.Entries)-1].Index
-	}
-	//寻找冲突点
-	i := m.Index + 1
-	j := 0
-	for m.Entries != nil && i <= lastLogIndex && j < len(m.Entries) {
-		tmpTerm, _ := r.RaftLog.Term(i)
-		if tmpTerm == m.Entries[j].Term {
-			i++
-			j++
+		if conflictIndex == 0 {
+			//没有冲突，啥也不做
+		} else if conflictIndex <= r.RaftLog.committed {
+			//传入的数据出错，how?
+			r.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", conflictIndex, r.RaftLog.committed)
 		} else {
-			break
+			//r.appendEntry(m.Entries[conflictIndex-m.Index-1:]...) //这是Leader自主进行的append方法
+			r.RaftLog.truncateAndAppend(m.Entries)
 		}
-	}
 
-	lastLogTerm, _ := r.RaftLog.Term(lastLogIndex)
-	if j >= len(m.Entries) {
-		// 发过来的entries完全匹配
-		DPrintf("[%v]--AE_Request--Ignore--:To [%v],LastIndex-%v,LastTerm-%v", m.From, r.id, lastLogIndex, lastLogTerm)
-	} else {
-		// 需要将m.Entries[j:]连接到r.log.Entries[0,i-1]后面
-		//if i-1 != m.Entries[j-1].Index {
-		//	panic(fmt.Sprintf("check the function,i-%v,m.Entries[j].Index-%v", i, m.Entries[j].Index))
-		//}
-		DPrintf("[%v]--AE_Request--Success--:To [%v],myTerm-%v,LeaderTerm-%v,afterIndex-%v,LastIndex-%v,myEntry-%v,appendEntry-%v,j-%v", m.From, r.id, r.Term, m.Term, i-1, r.RaftLog.LastIndex(), r.RaftLog.entries, m.Entries, j)
-		r.RaftLog.truncateAndAppend(getEntries(m.Entries[j:]))
-		DPrintf("[%v]--AE_Request--Success--:To [%v],myTerm-%v,LeaderTerm-%v,afterIndex-%v,LastIndex-%v", m.From, r.id, r.Term, m.Term, i-1, r.RaftLog.LastIndex())
-	}
-
-	//更新commit
-	if m.Commit > r.RaftLog.committed {
-		//If leaderCommit > commitIndex, set commitIndex =
-		//min(leaderCommit, index of last new entry)
-		//更新commmit
-		//nxtCommitMax := min(m.Commit, r.RaftLog.LastIndex())
-		//Leader commit了并且共享来的数据可以commit
-		//外层min可以去掉，因为反正新的entry会append上去
+		// If leaderCommit > commitIndex, set commitIndex =
+		// min(leaderCommit, index of last new entry)
 		//6.824因为commit一定会同时发过来对应的entry，和这里有所不同
-		nxtCommitMax := min(min(m.Commit, m.Index+uint64(len(m.Entries))), r.RaftLog.LastIndex())
-		DPrintf("[%v]--AE_Request--UpdateCommit--Success--:oldCommitIndex-%v,nxtCommitMax-%v", r.id, r.RaftLog.committed, nxtCommitMax)
-		r.RaftLog.committed = nxtCommitMax
+		r.RaftLog.commitTo(min(m.Commit, lastNew))
+		response.Index = r.RaftLog.LastIndex()
 	} else {
-		//DPrintf("[%v]--AE_Request--UpdateCommit--No--:commitIndex-%v,LeaderCommit-%v", r.id, r.RaftLog.committed, m.Commit)
+		// Reply false if log doesn’t contain an entry at prevLogIndex
+		// whose term matches prevLogTerm (§5.3)
+		response.Index = r.RaftLog.LastIndex()
+		response.Reject = true
 	}
-	r.send(mRes)
+	//log.Infof("%d response append entries to %d with %v", r.id, m.From, response)
+	r.send(response)
+}
+
+// handleHeartbeat handle Heartbeat RPC request
+func (r *Raft) handleHeartbeat(m pb.Message) {
+	// Your Code Here (2A).
+	//首先判断处理m中的commit信息，然后回复
+	r.RaftLog.commitTo(m.Commit)
+	r.send(pb.Message{To: m.From, Index: r.RaftLog.LastIndex(), MsgType: pb.MessageType_MsgHeartbeatResponse, Commit: r.RaftLog.committed})
 }
 
 // handleSnapshot handle Snapshot RPC request
-// 在step Snapshot之前，上层的snapWorker已经接收到了snapshot对应的状态机
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
-	if m.Term < r.Term {
-		return
-	}
-	r.electionElapsed = 0
-	r.Lead = m.From
-
-	meta := m.Snapshot.Metadata
-	// 过时消息
-	if meta.Index <= r.RaftLog.committed {
-		return
-	}
-	engine_util.DPrintf("RID[%v] -- Receive[snapshot](snapIndex,snapTerm) -- entry-[%v,%v],from-%v", r.id, m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term, m.From)
-	//engine_util.DPrintf("RID[%v] -- myEntries-%v,from-%v", r.id, r.RaftLog.entries, m.From)
-
-	// 更新内部状态
-	r.RaftLog.applied, r.RaftLog.committed, r.RaftLog.stabled = meta.Index, meta.Index, meta.Index
-	// 删除内存中无用的Log，感觉也可以不在这里删，之后试下
-	if len(r.RaftLog.entries) != 0 {
-		if meta.Index >= r.RaftLog.LastIndex() {
-			r.RaftLog.entries = make([]pb.Entry, 0)
-		} else if meta.Index >= r.RaftLog.entries[0].Index {
-			r.RaftLog.entries = r.RaftLog.entries[meta.Index-r.RaftLog.entries[0].Index+1:]
+	index, _ := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	if index <= r.RaftLog.committed {
+		// truncateIndex<=committed 忽略此快照
+	} else {
+		// 设置了pendingSnapshot后要清空entries，同时更新其他的信息
+		log.Debugf("handleSnapshot:%#v", m.Snapshot.Metadata)
+		truncateIndex := m.Snapshot.Metadata.Index
+		truncateTerm := m.Snapshot.Metadata.Term
+		r.RaftLog.entries = []pb.Entry{}
+		r.RaftLog.pendingSnapshot = m.Snapshot
+		r.RaftLog.committed = truncateIndex
+		r.RaftLog.applied = truncateIndex
+		r.RaftLog.stabled = truncateIndex
+		r.RaftLog.dummyIndex = truncateIndex
+		r.RaftLog.dummyTerm = truncateTerm
+		r.Prs = make(map[uint64]*Progress)
+		for _, node := range m.Snapshot.Metadata.ConfState.Nodes {
+			r.Prs[node] = &Progress{}
 		}
 	}
-	//engine_util.DPrintf("RID[%v] -- nextEntries-%v,from-%v,myApplyIndex-%v", r.id, r.RaftLog.entries, m.From, r.RaftLog.applied)
-
-	//meta.ConfState 2C中测试有
-	r.Prs = make(map[uint64]*Progress, 0)
-	for _, peer := range meta.ConfState.Nodes {
-		r.Prs[peer] = &Progress{}
-	}
-	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()})
 }
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
-	if _, ok := r.Prs[id]; ok {
-		DPrintf("[%v]--AddNode-%v Fail--has exist,term-%v", r.id, id, r.Term)
+	_, ok := r.Prs[id]
+	if ok {
 		return
 	}
-	if r.State == StateLeader {
-		// addNode的时候需要Next为0，促使其发送snapshot
-		r.Prs[id] = &Progress{
-			Match: 0,
-			Next:  0,
-		}
-	} else {
-		r.Prs[id] = &Progress{}
+	r.Prs[id] = &Progress{
+		// 设置为0可以在下次心跳时快速给新节点发送快照
+		Next:  0,
+		Match: 0,
 	}
-	DPrintf("[%v]--AddNode-%v Success--next-%v,match-%v,term-%v", r.id, id, r.Prs[id].Next, r.Prs[id].Match, r.Term)
-
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
-	if _, ok := r.Prs[id]; !ok {
-		DPrintf("[%v]--RemoveNode-%v Fail--not exist,term-%v", r.id, id, r.Term)
-		return
-	}
-	if id == r.id {
-		DPrintf("[%v]--DestroyNode-%v Success--term-%v", r.id, id, r.Term)
-		r.Prs = make(map[uint64]*Progress, 0)
+	_, ok := r.Prs[id]
+	if !ok {
 		return
 	}
 	delete(r.Prs, id)
-	DPrintf("[%v]--RemoveNode-%v Success--term-%v", r.id, id, r.Term)
+	if id != r.id {
+		r.tryCommitAndBroadCast()
+	}
+}
 
-	// 更新CommitIndex
-	r.updateCommitIndexL()
+func (r *Raft) resetRandomElectionTimeout() {
+	r.randomElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+}
+
+func (r *Raft) reset(term uint64) {
+	//重新设置term、重新设置超时时间、重置Lead、Vote等
+	if r.Term != term {
+		//新的term，说明遇到了具有更大term的msg,重新设置voteFor,会在step中确认投票时改成对应的Vote
+		r.Term = term
+		r.Vote = None
+	}
+	r.Lead = None
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomElectionTimeout()
+
+	//重置votes、progress等信息
+	r.votes = make(map[uint64]bool)
+	for peerId := range r.Prs {
+		//只有Leader节点用得到这个数据
+		r.Prs[peerId].Next = r.RaftLog.LastIndex() + 1
+		r.Prs[peerId].Match = 0
+		if peerId == r.id {
+			r.Prs[peerId].Match = r.RaftLog.LastIndex()
+		}
+		//log.Debugf("%d!!!!!!!!!!!%+v", peerId, r.Prs[peerId])
+
+	}
+}
+
+func (r *Raft) tickElection() {
+	r.electionElapsed++
+	if r.electionElapsed >= r.randomElectionTimeout {
+		r.electionElapsed = 0
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
+	}
+}
+
+func (r *Raft) tickHeartBeat() {
+	r.heartbeatElapsed++
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgBeat})
+	}
+}
+
+func (r *Raft) send(message pb.Message) {
+	message.From = r.id
+	r.msgs = append(r.msgs, message)
+	//r.logger.Infof()
+
+	//log.Infof("%x send msg %+v LEN(MSG)=%d", r.id, message, len(r.msgs))
+	//log.Infof("")
+}
+
+func (r *Raft) stepFollower(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgHeartbeat:
+		//follower收到了heartbeat消息
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleHeartbeat(m)
+	case pb.MessageType_MsgPropose:
+		//收到prop请求，转发给Leader
+		if r.Lead != None {
+			m.To = r.Lead
+			r.send(m)
+		}
+	case pb.MessageType_MsgAppend:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgSnapshot:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleSnapshot(m)
+	case pb.MessageType_MsgTimeoutNow:
+		//开始新一轮的选举
+		r.electionElapsed = 0
+		r.startElection()
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
+	}
+
+}
+
+func (r *Raft) stepCandidate(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgRequestVoteResponse:
+		_, reject, res := r.pollAndCountVotes(m.From, !m.Reject)
+		if res {
+			r.becomeLeader()
+			r.broadCastAppend() //变成Leader之后添加了noop，broadcast一下
+		} else if reject >= int(len(r.Prs)/2)+1 {
+			//选举失败，超过一半的节点拒绝了
+			r.becomeFollower(r.Term, None)
+		}
+	case pb.MessageType_MsgAppend:
+		//candidate收到了term>=自身的心跳，说明有新的Leader已经产生了
+		//在此时，只有m.Term == r.Term，因为若m.Term>r.term,
+		//会在step中直接变为follower
+		r.becomeFollower(m.Term, m.From)
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		//candidate收到了heartbeat消息:
+		//如果说是更大的term到来，则会在前面的step中自动转为follower，不会来到这里
+		//所以只能是以相同term竞选的candidate成功当选成为Leader后发送心跳到来，candidate要转为follower
+		r.becomeFollower(r.Term, m.From)
+		r.handleHeartbeat(m)
+	case pb.MessageType_MsgPropose:
+		//收到本地的prop请求，然而candidate并不知道Leader，丢弃请求
+	case pb.MessageType_MsgSnapshot:
+		r.becomeFollower(r.Term, m.From)
+		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
+	}
+}
+
+func (r *Raft) stepLeader(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgBeat:
+		r.broadCastHeartBeat()
+	case pb.MessageType_MsgPropose:
+		//收到prop请求，触发Leader对log的操作
+		if len(m.Entries) == 0 { //检查entries数组是否没有数据，这是一个保护性检查。
+			r.logger.Panicf("%x stepped empty MsgPropose", r.id)
+		}
+		if r.leadTransferee == 0 { // 判断是否正在LeaderTransfer
+			r.appendEntry(m.Entries...) //在appendEntry里面会更新match、commit等值
+			r.broadCastAppend()
+		}
+	case pb.MessageType_MsgHeartbeatResponse:
+		if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+			r.sendAppend(m.From)
+		}
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendResponse(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
+	}
+
+}
+
+func (r *Raft) startElection() {
+	_, ok := r.Prs[r.id]
+	if !ok {
+		// has been removed from the group
+		return
+	}
+	//首先，变为Candidate
+	r.becomeCandidate()
+	//修改votes状态信息，为自己投一票
+	_, _, res := r.pollAndCountVotes(r.id, true)
+	if res {
+		//只有一个节点，直接成为Leader
+		r.becomeLeader()
+		return
+	}
+	//给其他peer发送投票请求
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		lastIndex := r.RaftLog.LastIndex()
+		lastTerm, _ := r.RaftLog.Term(lastIndex)
+		r.send(pb.Message{Term: r.Term, To: id, MsgType: pb.MessageType_MsgRequestVote, Index: lastIndex, LogTerm: lastTerm})
+	}
+}
+
+func (r *Raft) pollAndCountVotes(id uint64, voteResult bool) (int, int, bool) {
+	//修改votes
+	r.votes[id] = voteResult
+	granted, rejected := 0, 0
+	for peerId := range r.Prs {
+		v, ok := r.votes[peerId]
+		if !ok {
+			//peerId的票还没有结果
+			continue
+		}
+		if v {
+			//peerId同意投票
+			granted++
+		} else {
+			//peerId拒绝投票
+			rejected++
+		}
+	}
+	return granted, rejected, granted >= int(len(r.Prs)/2)+1
+}
+
+func (r *Raft) broadCastHeartBeat() {
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		r.sendHeartbeat(id)
+	}
+}
+
+func (r *Raft) appendEntry(entries ...*pb.Entry) {
+	lastIndex := r.RaftLog.LastIndex()
+	for i := range entries {
+		entries[i].Term = r.Term
+		entries[i].Index = lastIndex + uint64(i) + 1
+	}
+	r.RaftLog.truncateAndAppend(entries)
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+	r.tryCommitAndBroadCast()
+}
+
+func (r *Raft) broadCastAppend() {
+	for id := range r.Prs {
+		if id == r.id {
+			continue
+		}
+		r.sendAppend(id)
+	}
+}
+
+func (r *Raft) handleAppendResponse(m pb.Message) {
+	if m.Reject {
+		//append失败了，尝试回退nextIndex后重新发送
+		//m.index是follower的lastIndex，若nextIndex-1>m.index+1,可以直接更新到这里
+		r.Prs[m.From].Next = max(1, min(m.Index+1, r.Prs[m.From].Next-1))
+		r.sendAppend(m.From)
+	} else {
+		//更新该节点的next、match
+		if r.Prs[m.From].Match < m.Index {
+			r.Prs[m.From].Match = m.Index
+			r.Prs[m.From].Next = r.Prs[m.From].Match + 1
+			//更新match之后检测更新这个commited
+			r.tryCommitAndBroadCast()
+		}
+		// 判断是否正在LeaderTransfer以及是否满足转移条件
+		if r.leadTransferee != 0 && r.leadTransferee == m.From {
+			if r.Prs[r.leadTransferee].Match == r.RaftLog.LastIndex() {
+				// 符合条件，发送MsgTimeoutNow消息
+				r.send(pb.Message{Term: r.Term, To: r.leadTransferee, MsgType: pb.MessageType_MsgTimeoutNow})
+			} else {
+				// 发送Append消息
+				r.sendAppend(r.leadTransferee)
+			}
+		}
+	}
+}
+
+func (r *Raft) tryCommitAndBroadCast() {
+	//获取所有的match值排序后取中位数
+	temp := make(uint64Slice, 0, len(r.Prs))
+	for id := range r.Prs {
+		temp = append(temp, r.Prs[id].Match)
+	}
+	sort.Sort(temp)
+	if r.RaftLog.tryCommit(temp[int(len(r.Prs)-1)/2], r.Term) {
+		//r.logger.Infof("%x commit to %x", r.id, r.RaftLog.committed)
+		//更新了commit，要broadcast告诉大家
+		r.broadCastAppend()
+	}
+}
+
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	if r.State != StateLeader {
+		//转发此消息
+		r.send(pb.Message{Term: r.Term, To: r.Lead, MsgType: pb.MessageType_MsgTransferLeader})
+	} else {
+		if r.Lead == m.From {
+			// Transfer leadership to self, there will be noop.
+			r.leadTransferee = 0
+			return
+		}
+		_, ok := r.Prs[m.From]
+		if !ok {
+			// Transfer leadership to non-existing node, there will be noop.
+			r.leadTransferee = 0
+			return
+		}
+		r.leadTransferee = m.From
+		if r.Prs[r.leadTransferee].Match == r.RaftLog.LastIndex() {
+			// 符合条件，发送MsgTimeoutNow消息
+			r.send(pb.Message{Term: r.Term, To: r.leadTransferee, MsgType: pb.MessageType_MsgTimeoutNow})
+		} else {
+			// 发送Append消息
+			r.sendAppend(r.leadTransferee)
+		}
+	}
 }
