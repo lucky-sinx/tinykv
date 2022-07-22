@@ -763,6 +763,10 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 					meta.WriteRegionState(writeBatch, region, rspb.PeerState_Normal)
 					meta.WriteRegionState(writeBatch, newRegion, rspb.PeerState_Normal)
 
+					if d.IsLeader() { // try to fix find no region
+						d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+						p.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+					}
 				}
 			}
 
