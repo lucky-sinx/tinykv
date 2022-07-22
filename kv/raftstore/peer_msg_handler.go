@@ -61,7 +61,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if applySnapResult != nil {
 			// 修改storeMeta需要加锁，如maybeCreatePeer()中也修改了
 			d.ctx.storeMeta.Lock()
-			d.ctx.storeMeta.regions[d.Region().Id] = d.Region()
+			d.ctx.storeMeta.setRegion(applySnapResult.Region, d.peer)
+			// 当新增节点时region在snapshot时才同步，需要在这里更新regionRanges
+			d.ctx.storeMeta.regionRanges.Delete(&regionItem{applySnapResult.PrevRegion})
+			d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{applySnapResult.Region})
 			d.ctx.storeMeta.Unlock()
 		}
 		//3. 发送ready中的消息。然后将已经提交的日志项应用到状态机。

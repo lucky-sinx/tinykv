@@ -242,8 +242,8 @@ func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (b
 	meta.regions[regionID] = peer.Region()
 	d.ctx.router.register(peer)
 	_ = d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeStart})
-	// destroyPeer()时会删除，创建节点时需要重新加入
-	meta.regionRanges.ReplaceOrInsert(&regionItem{region: peer.Region()})
+	// destroyPeer()时会删除，创建节点时需要重新加入，不能在这修改，应该等到snapshot时再添加
+	//meta.regionRanges.ReplaceOrInsert(&regionItem{region: peer.Region()})
 	return true, nil
 }
 
