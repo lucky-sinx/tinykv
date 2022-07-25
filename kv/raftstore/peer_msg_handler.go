@@ -63,7 +63,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			d.ctx.storeMeta.Lock()
 			d.ctx.storeMeta.setRegion(applySnapResult.Region, d.peer)
 			// 当新增节点时region在snapshot时才同步，需要在这里更新regionRanges
-			d.ctx.storeMeta.regionRanges.Delete(&regionItem{applySnapResult.PrevRegion})
+
+			//注意当节点初次创建时PrevRegion中的startKey为""，而B+树Delete删这个region可能导致regionRanges维护错误，导致后面出现meta corruption detected，直接ReplaceOrInsert就好
+			//d.ctx.storeMeta.regionRanges.Delete(&regionItem{applySnapResult.PrevRegion})
 			d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{applySnapResult.Region})
 			d.ctx.storeMeta.Unlock()
 		}
@@ -402,6 +404,12 @@ func (d *peerMsgHandler) handleSplit(request *raft_cmdpb.AdminRequest, kvWB *eng
 	if err != nil {
 		return
 	}
+	if len(split.NewPeerIds) != len(d.Region().Peers) {
+		//log.Warning(fmt.Sprintf("storeID,peerId,RegionId[%v,%v,%v]--split peers not match,myPeer-%v,newPeer-%v,Epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers, split.NewPeerIds, d.Region().RegionEpoch))
+		//return
+		panic(fmt.Sprintf("storeID,peerId,RegionId[%v,%v,%v]--split peers not match,myPeer-%v,newPeer-%v,Epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers, split.NewPeerIds, d.Region().RegionEpoch))
+
+	}
 	// 新建region，注意要将region.peers排序后分配peerId，不然可能不同peer上新建时newPeerId对应分裂的peer不同
 	for i, _ := range d.Region().Peers {
 		for j := i + 1; j < len(d.Region().Peers); j++ {
@@ -704,7 +712,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			err = d.RaftGroup.Propose(data)
 			if err != nil {
 				cb.Done(ErrResp(err))
-				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit1-%v,Propose[Split]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, err, d.RaftGroup.Raft.RaftLog.LastIndex(), d.Term(), request.Split)
+				//engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit1-%v,Propose[Split]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, err, d.RaftGroup.Raft.RaftLog.LastIndex(), d.Term(), request.Split)
 
 				return
 			} else {
@@ -1101,14 +1109,39 @@ func (d *peerMsgHandler) onSplitRegionCheckTick() {
 func (d *peerMsgHandler) onPrepareSplitRegion(regionEpoch *metapb.RegionEpoch, splitKey []byte, cb *message.Callback) {
 	// 验证是否应该执行该split
 	if err := d.validateSplitRegion(regionEpoch, splitKey); err != nil {
-		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit2-%v,Propose[Split]Command(index,term,request) ", d.Meta.StoreId, d.PeerId(), d.regionId, err)
+		//engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit2-%v,Propose[Split]Command(index,term,request) ", d.Meta.StoreId, d.PeerId(), d.regionId, err)
 
 		cb.Done(ErrResp(err))
 		return
 	}
-	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit3,Propose[Split]Command(index,term,request) ", d.Meta.StoreId, d.PeerId(), d.regionId)
+	//engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit3,Propose[Split]Command(index,term,request) ", d.Meta.StoreId, d.PeerId(), d.regionId)
 
-	region := d.Region()
+	// !!!!!!!!!bug
+	//region := d.Region()
+	/*
+		我们在peerMsgHandler内生成SchedulerAskSplitTask时会将region放到Task中，
+		之后在SchedulerTaskHandler的onAskSplit()函数异步请求分配新region的peerId，
+		再生成AdminCmdType_Split命令回到peerMsgHandler中处理。
+		因为peerMsgHandler是串行处理请求的，
+		所以表面上看因为SchedulerAskSplitTask的生成与AdminCmdType_Split处理是串行的，
+		故即使异步请求分配新region的peerId没有问题，即使分配前后region变了，
+		但SchedulerAskSplitTask带了旧的region过去，生成的AdminCmdType_Split会因为Epoch过旧而无法执行，
+		但原代码中SchedulerAskSplitTask带的region信息是一个指针，导致在异步分配新region的peerId前后的region发生变化，
+		我们是用旧的region信息分配的peerId，但生成AdminCmdType_Split时返回的RegionEpoch却是新的，
+		使其通过了RegionEpoch的检测，这也是上一个注意点要判断split Key的根本原因，
+		同样confChange后也有可能有旧的split通过了RegionEpoch的判定导致分配新peerId不对，
+		可以通过SchedulerAskSplitTask生成时复制一遍Region解决
+	*/
+	region := new(metapb.Region)
+	data, err := d.Region().Marshal()
+	if err != nil {
+		panic(err)
+	}
+	err = region.Unmarshal(data)
+	if err != nil {
+		panic(err)
+	}
+
 	d.ctx.schedulerTaskSender <- &runner.SchedulerAskSplitTask{
 		Region:   region,
 		SplitKey: splitKey,

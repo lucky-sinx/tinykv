@@ -2,8 +2,6 @@ package runner
 
 import (
 	"context"
-	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
-
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/scheduler_client"
@@ -93,7 +91,7 @@ func (r *SchedulerTaskHandler) onAskSplit(t *SchedulerAskSplitTask) {
 	resp, err := r.SchedulerClient.AskSplit(context.TODO(), t.Region)
 	if err != nil {
 		log.Error(err)
-		engine_util.DPrintf(" FailSplit5-%v", err)
+		//engine_util.DPrintf(" FailSplit5-%v", err)
 
 		return
 	}

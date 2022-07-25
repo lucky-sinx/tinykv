@@ -46,11 +46,11 @@ func (r *splitCheckHandler) Handle(t worker.Task) {
 		hex.EncodeToString(region.StartKey), hex.EncodeToString(region.EndKey))
 	key := r.splitCheck(regionId, region.StartKey, region.EndKey)
 	if key != nil {
-		engine_util.DPrintf(" FailSplit7")
+		//engine_util.DPrintf(" FailSplit7")
 
 		_, userKey, err := codec.DecodeBytes(key)
 		if err == nil {
-			engine_util.DPrintf(" FailSplit6-%v", err)
+			//engine_util.DPrintf(" FailSplit6-%v", err)
 			// It's not a raw key.
 			// To make sure the keys of same user key locate in one Region, decode and then encode to truncate the timestamp
 			key = codec.EncodeBytes(userKey)
@@ -127,7 +127,7 @@ func (checker *sizeSplitChecker) onKv(key []byte, item engine_util.DBItem) bool 
 	valueSize := uint64(item.ValueSize())
 	size := uint64(len(key)) + valueSize
 	checker.currentSize += size
-	engine_util.DPrintf(" FailSplitOnkv-currentSize-%v,splitSize-%v，maxSize-%v", checker.currentSize, checker.splitSize, checker.maxSize)
+	//engine_util.DPrintf(" FailSplitOnkv-currentSize-%v,splitSize-%v，maxSize-%v", checker.currentSize, checker.splitSize, checker.maxSize)
 	if checker.currentSize > checker.splitSize && checker.splitKey == nil {
 		checker.splitKey = util.SafeCopy(key)
 	}
