@@ -108,6 +108,8 @@ func (c *Config) validate() error {
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
 	Match, Next uint64
+	// 上次与Follow通信时间
+	LastCommunicateTS int64
 }
 
 type Raft struct {
@@ -161,6 +163,17 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	// 存在网络分区时可能多个Leader，都发RegionHeartBeatTask导致pd中leader不断切换，
+	// 影响性能甚至有时导致请求一直request Timeout。可以记录Leader和各个Follow通信时间，
+	// 每隔一段时间检测一次Leader是否与半数以上节点通信，失效则退回Follow
+	// 多少tick检测一次Leader是否还有效
+	leaderAliveTimeout int64
+	leaderAliveElapsed int64
+	// 多少tick表示Leader与Follow无法通信
+	leaderLeaseTimeout int64
+	// 当前tick数
+	tickCnt int64
 }
 
 // 读取持久化数据
@@ -210,12 +223,16 @@ func newRaft(c *Config) *Raft {
 
 		msgs: make([]pb.Message, 0),
 
-		heartbeatTimeout: c.HeartbeatTick,
-		electionTimeout:  c.ElectionTick,
-		heartbeatElapsed: 0,
-		electionElapsed:  0,
-		leadTransferee:   0,
-		PendingConfIndex: 0,
+		heartbeatTimeout:   c.HeartbeatTick,
+		electionTimeout:    c.ElectionTick,
+		leaderAliveTimeout: int64(c.ElectionTick) * 2,
+		leaderLeaseTimeout: int64(c.ElectionTick) * 9 / 10,
+		heartbeatElapsed:   0,
+		electionElapsed:    0,
+		tickCnt:            0,
+		leaderAliveElapsed: 0,
+		leadTransferee:     0,
+		PendingConfIndex:   0,
 	}
 
 	// 上层传节点数据时实际上是在peerStorage中，但2A的测试中是在config中传过来的
@@ -404,8 +421,17 @@ func (r *Raft) broadcastVote() {
 func (r *Raft) tick() {
 	// Your Code Here (2A).
 	if r.State == StateLeader {
+		r.tickCnt++
+		r.leaderAliveElapsed++
+		// Leader检测是否应该退回Follow
+		if r.leaderAliveElapsed >= r.leaderAliveTimeout {
+			r.leaderAliveElapsed = 0
+			if r.checkGoBackFollow() {
+				return
+			}
+		}
 		r.heartbeatElapsed++
-		// Leader超时处理
+		// Leader超时发送心跳
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
 			r.Step(pb.Message{
@@ -424,7 +450,7 @@ func (r *Raft) tick() {
 		//}
 	} else {
 		r.electionElapsed++
-		// Follow,Candidate超时处理
+		// Follow,Candidate超时选举
 		if r.electionElapsed >= r.randomElectionTimeout {
 			r.electionElapsed = 0
 			r.Step(pb.Message{
@@ -481,9 +507,12 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 
 	lastIndex := r.RaftLog.LastIndex()
+	r.tickCnt = 0
+	r.leaderAliveElapsed = 0
 	for peer := range r.Prs {
 		r.Prs[peer].Next = lastIndex + 1
 		r.Prs[peer].Match = 0
+		r.Prs[peer].LastCommunicateTS = r.tickCnt
 	}
 	DPrintf("[%v]--init--:Leader--[Term-%v,Lead-%v]\n\n", r.id, r.Term, r.Lead)
 
@@ -494,6 +523,27 @@ func (r *Raft) becomeLeader() {
 	// 这里是用的老配置进行同步，日志提交后才变更节点，没有这个问题
 	r.appendEntry(&pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1})
 	r.broadcastAppend()
+}
+
+// Leader自我检测是否退回Follow
+func (r *Raft) checkGoBackFollow() bool {
+	communicateCnt := 1
+	for i, prs := range r.Prs {
+		if i == r.id {
+			continue
+		}
+		if r.tickCnt-prs.LastCommunicateTS < r.leaderLeaseTimeout {
+			communicateCnt++
+		}
+	}
+
+	// 半数以上正常通信
+	if communicateCnt >= len(r.Prs)/2+1 {
+		return false
+	}
+	// Leader超时退回Follow
+	r.becomeFollower(r.Term, None)
+	return true
 }
 
 // append新的日志条目
@@ -578,6 +628,9 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 	// 处理心跳response
 	case pb.MessageType_MsgHeartbeatResponse:
 		if r.Term >= m.Term {
+			// 记录上次通信时间
+			r.Prs[m.From].LastCommunicateTS = r.tickCnt
+
 			pr := r.Prs[m.From]
 			if r.leadTransferee == None && r.RaftLog.LastIndex() > pr.Match {
 				r.sendAppend(m.From)
@@ -593,8 +646,10 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 
 	// 处理AppendEntry response
 	case pb.MessageType_MsgAppendResponse:
-		pr := r.Prs[m.From]
+		// 记录上次通信时间
+		r.Prs[m.From].LastCommunicateTS = r.tickCnt
 
+		pr := r.Prs[m.From]
 		if m.Reject {
 			DPrintf("[%v]--AE_Response--ConflictAndNewNext--:To [%v],myTerm-%v,oldNext-%v,newNext-%v", r.id, m.From, r.Term, pr.Next, m.Index)
 			// 更新nextIndex寻找最大共识

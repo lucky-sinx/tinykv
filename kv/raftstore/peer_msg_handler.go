@@ -405,9 +405,9 @@ func (d *peerMsgHandler) handleSplit(request *raft_cmdpb.AdminRequest, kvWB *eng
 		return
 	}
 	if len(split.NewPeerIds) != len(d.Region().Peers) {
-		//log.Warning(fmt.Sprintf("storeID,peerId,RegionId[%v,%v,%v]--split peers not match,myPeer-%v,newPeer-%v,Epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers, split.NewPeerIds, d.Region().RegionEpoch))
-		//return
-		panic(fmt.Sprintf("storeID,peerId,RegionId[%v,%v,%v]--split peers not match,myPeer-%v,newPeer-%v,Epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers, split.NewPeerIds, d.Region().RegionEpoch))
+		log.Warning(fmt.Sprintf("storeID,peerId,RegionId[%v,%v,%v]--split peers not match,myPeer-%v,newPeer-%v,Epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers, split.NewPeerIds, d.Region().RegionEpoch))
+		return
+		//panic(fmt.Sprintf("storeID,peerId,RegionId[%v,%v,%v]--split peers not match,myPeer-%v,newPeer-%v,Epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers, split.NewPeerIds, d.Region().RegionEpoch))
 
 	}
 	// 新建region，注意要将region.peers排序后分配peerId，不然可能不同peer上新建时newPeerId对应分裂的peer不同
