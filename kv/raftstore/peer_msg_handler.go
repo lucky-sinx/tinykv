@@ -78,19 +78,31 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		//}
 
 		if len(ready.CommittedEntries) > 0 {
-			kvWB := &engine_util.WriteBatch{}
-			for _, entry := range ready.CommittedEntries {
-				d.applyEntry(&entry, kvWB)
-				if d.stopped {
-					// 可能apply了一条remove自己的命令，调用了destory()会删除该region的元信息,直接返回，不用继续执行下面了
-					// 否则报错：
-					// panic: [region 1] 2 unexpected raft log index: lastIndex 0 < appliedIndex 8
-					return
-				}
+			t := time.Now()
+			//kvWB := &engine_util.WriteBatch{}
+			//for _, entry := range ready.CommittedEntries {
+			//	d.applyEntry(&entry, kvWB)
+			//	if d.stopped {
+			//		// 可能apply了一条remove自己的命令，调用了destory()会删除该region的元信息,直接返回，不用继续执行下面了
+			//		// 否则报错：
+			//		// panic: [region 1] 2 unexpected raft log index: lastIndex 0 < appliedIndex 8
+			//		return
+			//	}
+			//}
+			//d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
+			//kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			//kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+			ch := make(chan bool, 1)
+			applyTask := &AsyncApplyTask{
+				D:                d,
+				CommittedEntries: ready.CommittedEntries,
+				Notifier:         ch,
 			}
-			d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
-			kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-			kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+			d.ctx.applyTaskSender <- applyTask
+			//<-ch
+
+			duration := time.Since(t)
+			log.Infof("%v apply %d entries %v in time %v", d.Tag, ready.CommittedEntries, len(ready.CommittedEntries), duration)
 		}
 		// 调用advance
 		d.RaftGroup.Advance(ready)
@@ -660,6 +672,10 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 			for _, request := range msg.Requests {
 				switch request.CmdType {
 				case raft_cmdpb.CmdType_Get:
+					d.peerStorage.applyState.AppliedIndex = e.Index
+					writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+					writeBatch.Reset()
 					value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, request.Get.Cf, request.Get.Key)
 					if err != nil {
 						// key not exist
@@ -686,8 +702,10 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 
 				case raft_cmdpb.CmdType_Snap:
 					//log.Infof("%v snap key=%v,value=%v", d.Tag, string(request.Put.Key), string(request.Put.Value))
+					d.peerStorage.applyState.AppliedIndex = e.Index
 					writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 					writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+					writeBatch.Reset()
 
 					region := &metapb.Region{
 						Id:       d.Region().Id,
@@ -833,8 +851,8 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 		}
 		region.RegionEpoch.ConfVer++
 		meta.WriteRegionState(writeBatch, region, rspb.PeerState_Normal)
-		writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
-		writeBatch.Reset()
+		//writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+		//writeBatch.Reset()
 		// 2.修改元数据，让storeWorker在后续通过心跳机制创建peer
 		d.ctx.storeMeta.Lock()
 		//d.SetRegion(region)
@@ -846,8 +864,8 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 		d.RaftGroup.ApplyConfChange(*cc)
 	}
 
-	writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
-	writeBatch.Reset()
+	//writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+	//writeBatch.Reset()
 	d.handleResponse(e, &raft_cmdpb.RaftCmdResponse{Header: header, Responses: responses})
 }
 

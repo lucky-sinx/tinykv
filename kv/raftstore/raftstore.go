@@ -96,6 +96,7 @@ type GlobalContext struct {
 	regionTaskSender     chan<- worker.Task
 	raftLogGCTaskSender  chan<- worker.Task
 	splitCheckTaskSender chan<- worker.Task
+	applyTaskSender      chan<- worker.Task
 	schedulerClient      scheduler_client.Client
 	tickDriverSender     chan uint64
 }
@@ -197,6 +198,7 @@ type workers struct {
 	schedulerWorker  *worker.Worker
 	splitCheckWorker *worker.Worker
 	regionWorker     *worker.Worker
+	applierWorker    *worker.Worker
 	wg               *sync.WaitGroup
 }
 
@@ -232,6 +234,7 @@ func (bs *Raftstore) start(
 		regionWorker:     worker.NewWorker("snapshot-worker", wg),
 		raftLogGCWorker:  worker.NewWorker("raft-gc-worker", wg),
 		schedulerWorker:  worker.NewWorker("scheduler-worker", wg),
+		applierWorker:    worker.NewWorker("applier-worker", wg),
 		wg:               wg,
 	}
 	bs.ctx = &GlobalContext{
@@ -246,6 +249,7 @@ func (bs *Raftstore) start(
 		regionTaskSender:     bs.workers.regionWorker.Sender(),
 		splitCheckTaskSender: bs.workers.splitCheckWorker.Sender(),
 		raftLogGCTaskSender:  bs.workers.raftLogGCWorker.Sender(),
+		applyTaskSender:      bs.workers.applierWorker.Sender(),
 		schedulerClient:      schedulerClient,
 		tickDriverSender:     bs.tickDriver.newRegionCh,
 	}
@@ -281,6 +285,7 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	workers.regionWorker.Start(runner.NewRegionTaskHandler(engines, ctx.snapMgr))
 	workers.raftLogGCWorker.Start(runner.NewRaftLogGCTaskHandler())
 	workers.schedulerWorker.Start(runner.NewSchedulerTaskHandler(ctx.store.Id, ctx.schedulerClient, NewRaftstoreRouter(router)))
+	workers.applierWorker.Start(NewAsyncApplyTaskHandler())
 	go bs.tickDriver.run()
 }
 
@@ -297,6 +302,7 @@ func (bs *Raftstore) shutDown() {
 	workers.regionWorker.Stop()
 	workers.raftLogGCWorker.Stop()
 	workers.schedulerWorker.Stop()
+	workers.applierWorker.Stop()
 	workers.wg.Wait()
 }
 

@@ -47,7 +47,7 @@ func (w *Worker) Stop() {
 	w.sender <- TaskStop{}
 }
 
-const defaultWorkerCapacity = 128
+const defaultWorkerCapacity = 12800
 
 func NewWorker(name string, wg *sync.WaitGroup) *Worker {
 	ch := make(chan Task, defaultWorkerCapacity)
