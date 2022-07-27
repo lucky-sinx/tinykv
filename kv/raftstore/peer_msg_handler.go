@@ -172,60 +172,47 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 
 		// 仅Write相关操作是batch的
 		// 和824不同，貌似没有记录重复消息的地方
-		request := msg.Requests[0]
 
 		// 因为可能存在split，当请求错误的region时应该返回错误
-		if err = d.checkKeyNotInRegion(request); err != nil {
+		if err = d.checkKeyNotInRegion(msg.Requests); err != nil {
 			d.callbackPropose(entry, ErrResp(err), nil)
 			return
 		}
 		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, entry.Index, entry.Term, msg.Requests)
 
+		//记录是否有snap,有的话需要new txn
+		flag := false
+
 		// apply所有外部请求
+		header := &raft_cmdpb.RaftResponseHeader{}
+		responses := make([]*raft_cmdpb.Response, 0)
 		for _, request := range msg.Requests {
-			switch request.CmdType {
-			case raft_cmdpb.CmdType_Get:
-			case raft_cmdpb.CmdType_Put:
-				put := request.Put
-				kvWB.SetCF(put.Cf, put.Key, put.Value)
-			case raft_cmdpb.CmdType_Delete:
-				del := request.Delete
-				kvWB.DeleteCF(del.Cf, del.Key)
-			case raft_cmdpb.CmdType_Snap:
-			}
-		}
-
-		// 返回结果
-		if len(d.proposals) != 0 {
-			header := &raft_cmdpb.RaftResponseHeader{}
-			response := &raft_cmdpb.RaftCmdResponse{
-				Header: header,
-			}
-
 			switch request.CmdType {
 			case raft_cmdpb.CmdType_Get:
 				get := request.Get
 				val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, get.Cf, get.Key)
-				response.Responses = []*raft_cmdpb.Response{{
+				responses = append(responses, &raft_cmdpb.Response{
 					CmdType: raft_cmdpb.CmdType_Get,
 					Get:     &raft_cmdpb.GetResponse{Value: val},
-				}}
+				})
 
 			case raft_cmdpb.CmdType_Put:
-				response.Responses = []*raft_cmdpb.Response{{
+				put := request.Put
+				kvWB.SetCF(put.Cf, put.Key, put.Value)
+				responses = append(responses, &raft_cmdpb.Response{
 					CmdType: raft_cmdpb.CmdType_Put,
 					Put:     &raft_cmdpb.PutResponse{},
-				}}
+				})
 
 			case raft_cmdpb.CmdType_Delete:
-				response.Responses = []*raft_cmdpb.Response{{
+				del := request.Delete
+				kvWB.DeleteCF(del.Cf, del.Key)
+				responses = append(responses, &raft_cmdpb.Response{
 					CmdType: raft_cmdpb.CmdType_Delete,
 					Delete:  &raft_cmdpb.DeleteResponse{},
-				}}
+				})
 			case raft_cmdpb.CmdType_Snap:
-				// 后面好像region可能会发生改变
 				//d.Region是一个指针，后面可能修改它的值，所以应该重新new一个Region复制过去
-
 				responseRegion := new(metapb.Region)
 				data, err := d.Region().Marshal()
 				if err != nil {
@@ -236,13 +223,22 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 					panic(err)
 				}
 				//engine_util.DPrintf("SNAP,region-%v", responseRegion)
-				response.Responses = []*raft_cmdpb.Response{{
+				responses = append(responses, &raft_cmdpb.Response{
 					CmdType: raft_cmdpb.CmdType_Snap,
 					Snap:    &raft_cmdpb.SnapResponse{Region: responseRegion},
-				}}
-				d.callbackPropose(entry, response, d.peerStorage.Engines.Kv.NewTransaction(false))
-				return
+				})
+				flag = true
 			}
+		}
+
+		// 返回结果
+		response := &raft_cmdpb.RaftCmdResponse{
+			Header:    header,
+			Responses: responses,
+		}
+		if flag {
+			d.callbackPropose(entry, response, d.peerStorage.Engines.Kv.NewTransaction(false))
+		} else {
 			d.callbackPropose(entry, response, nil)
 		}
 	}
@@ -471,22 +467,24 @@ func (d *peerMsgHandler) handleSplit(request *raft_cmdpb.AdminRequest, kvWB *eng
 	}
 }
 
-// 检查key是否在region范围中
-func (d *peerMsgHandler) checkKeyNotInRegion(request *raft_cmdpb.Request) error {
+// 是否所有key是否在region范围中
+func (d *peerMsgHandler) checkKeyNotInRegion(requests []*raft_cmdpb.Request) error {
 	// 因为可能存在split，当请求错误的region时应该返回错误
-	var key []byte
-	switch request.CmdType {
-	case raft_cmdpb.CmdType_Get:
-		key = request.Get.Key
-	case raft_cmdpb.CmdType_Put:
-		key = request.Put.Key
-	case raft_cmdpb.CmdType_Delete:
-		key = request.Delete.Key
-	}
-	if request.CmdType != raft_cmdpb.CmdType_Snap {
-		// ErrKeyNotInRegion
-		err := util.CheckKeyInRegion(key, d.Region())
-		return err
+	for _, request := range requests {
+		var key []byte
+		switch request.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			key = request.Get.Key
+		case raft_cmdpb.CmdType_Put:
+			key = request.Put.Key
+		case raft_cmdpb.CmdType_Delete:
+			key = request.Delete.Key
+		}
+		if request.CmdType != raft_cmdpb.CmdType_Snap {
+			// ErrKeyNotInRegion
+			err := util.CheckKeyInRegion(key, d.Region())
+			return err
+		}
 	}
 	return nil
 }
@@ -629,7 +627,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	if msg.AdminRequest == nil {
 		// 对于外部请求，记录它所在的位置
 		// 检查key是否在region范围中
-		if err = d.checkKeyNotInRegion(msg.Requests[0]); err != nil {
+		if err = d.checkKeyNotInRegion(msg.Requests); err != nil {
 			cb.Done(ErrResp(err))
 			return
 		}
