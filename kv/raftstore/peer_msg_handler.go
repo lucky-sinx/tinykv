@@ -711,8 +711,6 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			if err != nil {
 				cb.Done(ErrResp(err))
 				//engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- FailSplit1-%v,Propose[Split]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, err, d.RaftGroup.Raft.RaftLog.LastIndex(), d.Term(), request.Split)
-
-				return
 			} else {
 				response.AdminResponse = &raft_cmdpb.AdminResponse{
 					CmdType: raft_cmdpb.AdminCmdType_Split,
@@ -721,6 +719,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Propose[Split]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, d.RaftGroup.Raft.RaftLog.LastIndex(), d.Term(), request.Split)
 				cb.Done(response)
 			}
+			return
 		}
 	}
 	var data []byte
