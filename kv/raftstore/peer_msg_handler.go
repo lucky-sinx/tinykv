@@ -660,6 +660,10 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 			for _, request := range msg.Requests {
 				switch request.CmdType {
 				case raft_cmdpb.CmdType_Get:
+					d.peerStorage.applyState.AppliedIndex = e.Index
+					writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+					writeBatch.Reset()
 					value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, request.Get.Cf, request.Get.Key)
 					if err != nil {
 						// key not exist
@@ -686,8 +690,10 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 
 				case raft_cmdpb.CmdType_Snap:
 					//log.Infof("%v snap key=%v,value=%v", d.Tag, string(request.Put.Key), string(request.Put.Value))
+					d.peerStorage.applyState.AppliedIndex = e.Index
 					writeBatch.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 					writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+					writeBatch.Reset()
 
 					region := &metapb.Region{
 						Id:       d.Region().Id,
@@ -833,8 +839,8 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 		}
 		region.RegionEpoch.ConfVer++
 		meta.WriteRegionState(writeBatch, region, rspb.PeerState_Normal)
-		writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
-		writeBatch.Reset()
+		//writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+		//writeBatch.Reset()
 		// 2.修改元数据，让storeWorker在后续通过心跳机制创建peer
 		d.ctx.storeMeta.Lock()
 		//d.SetRegion(region)
@@ -846,8 +852,8 @@ func (d *peerMsgHandler) applyEntry(e *eraftpb.Entry, writeBatch *engine_util.Wr
 		d.RaftGroup.ApplyConfChange(*cc)
 	}
 
-	writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
-	writeBatch.Reset()
+	//writeBatch.WriteToDB(d.peerStorage.Engines.Kv)
+	//writeBatch.Reset()
 	d.handleResponse(e, &raft_cmdpb.RaftCmdResponse{Header: header, Responses: responses})
 }
 
