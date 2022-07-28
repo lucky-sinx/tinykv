@@ -697,6 +697,7 @@ func TestOneSplit3B(t *testing.T) {
 	left := cluster.GetRegion([]byte("k1"))
 	right := cluster.GetRegion([]byte("k2"))
 
+	//engine_util.DPrintf("test-left-%v,right-%v", left, right)
 	assert.NotEqual(t, left.GetId(), right.GetId())
 	assert.True(t, bytes.Equal(region.GetStartKey(), left.GetStartKey()))
 	assert.True(t, bytes.Equal(left.GetEndKey(), right.GetStartKey()))

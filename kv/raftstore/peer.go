@@ -114,6 +114,9 @@ type peer struct {
 	// 当只有两节点要删除Leader时，记录Follow重新尝试删除Leader的次数，为什么这样见configChange，主要是两军问题，无法保证两节点同时知道要删除其中一个节点
 	// 既然无解，后来改成更好控制的记录Transfer次数，到达一定次数删除Leader
 	//WantDeleteLeaderTimes uint64
+
+	// 记录哪些只读消息等待提交
+	readOnlyProposal []*raft.ReadOnlyEntry
 }
 
 func NewPeer(storeId uint64, cfg *config.Config, engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task,
@@ -151,6 +154,7 @@ func NewPeer(storeId uint64, cfg *config.Config, engines *engine_util.Engines, r
 		PeersStartPendingTime: make(map[uint64]time.Time),
 		Tag:                   tag,
 		ticker:                newTicker(region.GetId(), cfg),
+		readOnlyProposal:      make([]*raft.ReadOnlyEntry, 0),
 	}
 
 	// If this region has only one peer and I am the one, campaign directly.
@@ -244,6 +248,7 @@ func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 		NotifyReqRegionRemoved(region.Id, proposal.cb)
 	}
 	p.proposals = nil
+	p.readOnlyProposal = nil
 
 	log.Infof("%v destroy itself, takes %v", p.Tag, time.Now().Sub(start))
 	return nil

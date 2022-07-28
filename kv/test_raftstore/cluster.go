@@ -190,6 +190,8 @@ func (c *Cluster) Request(key []byte, reqs []*raft_cmdpb.Request, timeout time.D
 		regionID := region.GetId()
 		req := NewRequest(regionID, region.RegionEpoch, reqs)
 		resp, txn := c.CallCommandOnLeader(&req, timeout)
+		//log.Infof("%v get region:%v-------reqs:%v", string(key), region, reqs)
+
 		if resp == nil {
 			// it should be timeouted innerly
 			SleepMS(100)
@@ -202,6 +204,7 @@ func (c *Cluster) Request(key []byte, reqs []*raft_cmdpb.Request, timeout time.D
 		return resp, txn
 	}
 	panic("request timeout")
+	//panic(fmt.Sprintf("request timeout,key-%v,request-%v", string(key), reqs))
 }
 
 func (c *Cluster) CallCommand(request *raft_cmdpb.RaftCmdRequest, timeout time.Duration) (*raft_cmdpb.RaftCmdResponse, *badger.Txn) {
@@ -242,6 +245,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 		if resp.Header.Error != nil {
 			err := resp.Header.Error
 			if err.GetStaleCommand() != nil || err.GetEpochNotMatch() != nil || err.GetNotLeader() != nil {
+				//log.Infof("encouter retryable err %+v", resp)
 				log.Debugf("encouter retryable err %+v", resp)
 				if err.GetNotLeader() != nil && err.GetNotLeader().Leader != nil {
 					leader = err.GetNotLeader().Leader

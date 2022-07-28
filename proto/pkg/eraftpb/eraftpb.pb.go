@@ -77,6 +77,7 @@ const (
 	// 'MessageType_MsgTimeoutNow' send from the leader to the leadership transfer target, to let
 	// the transfer target timeout immediately and start a new election.
 	MessageType_MsgTimeoutNow MessageType = 12
+	MessageType_MsgReadOnly MessageType = 13
 )
 
 var MessageType_name = map[int32]string{

@@ -77,12 +77,23 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			// 通过ServerTransport将Ready中的Msg发送给其他节点
 			d.Send(d.ctx.trans, rd.Messages)
 		}
+
+		// 记录所有等待apply的只读消息
+		if len(rd.ReadOnlyEntries) != 0 {
+			d.readOnlyProposal = append(d.readOnlyProposal, rd.ReadOnlyEntries...)
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- [ReadOnlyProposal-%v],apply-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.readOnlyProposal, d.peerStorage.applyState.AppliedIndex)
+		}
+
+		// 在提交下一条命令前看下是否有可以apply的只读消息
+		d.callbackReadOnlyPropose(d.peerStorage.applyState.AppliedIndex)
+
 		if len(rd.CommittedEntries) != 0 {
-			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- -%v", d.Meta.StoreId, d.PeerId(), d.regionId, rd.CommittedEntries)
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- commitEntries-%v", d.Meta.StoreId, d.PeerId(), d.regionId, rd.CommittedEntries)
 			// 成功apply的entry
 			//successCommitEntries := make([]eraftpb.Entry, 0)
+			// 将write操作按照一个batch写入底层存储
+			kvWB := new(engine_util.WriteBatch)
 			for _, entry := range rd.CommittedEntries {
-				kvWB := new(engine_util.WriteBatch)
 				if entry.EntryType == eraftpb.EntryType_EntryConfChange {
 					// confChange
 					d.handleConfigChange(&entry, kvWB)
@@ -123,15 +134,19 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					return
 				}
 				d.peerStorage.applyState.AppliedIndex = entry.Index
-				err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
-				if err != nil {
-					panic(err)
-				}
-				err = d.peerStorage.Engines.WriteKV(kvWB)
-				if err != nil {
-					panic(err)
-				}
+
 			}
+			err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				panic(err)
+			}
+			err = d.peerStorage.Engines.WriteKV(kvWB)
+			if err != nil {
+				panic(err)
+			}
+			// 更新applyIndex后看下是否有可以apply的只读消息，可以在write后一块更新不影响一致性
+			d.callbackReadOnlyPropose(d.peerStorage.applyState.AppliedIndex)
+
 			//rd.CommittedEntries = successCommitEntries
 			//commitIndex := len(rd.CommittedEntries) - 1
 			//if commitIndex >= 0 {
@@ -178,24 +193,13 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 			d.callbackPropose(entry, ErrResp(err), nil)
 			return
 		}
-		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, entry.Index, entry.Term, msg.Requests)
-
-		//记录是否有snap,有的话需要new txn
-		flag := false
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Write]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, entry.Index, entry.Term, msg.Requests)
 
 		// apply所有外部请求
 		header := &raft_cmdpb.RaftResponseHeader{}
 		responses := make([]*raft_cmdpb.Response, 0)
 		for _, request := range msg.Requests {
 			switch request.CmdType {
-			case raft_cmdpb.CmdType_Get:
-				get := request.Get
-				val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, get.Cf, get.Key)
-				responses = append(responses, &raft_cmdpb.Response{
-					CmdType: raft_cmdpb.CmdType_Get,
-					Get:     &raft_cmdpb.GetResponse{Value: val},
-				})
-
 			case raft_cmdpb.CmdType_Put:
 				put := request.Put
 				kvWB.SetCF(put.Cf, put.Key, put.Value)
@@ -211,23 +215,6 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 					CmdType: raft_cmdpb.CmdType_Delete,
 					Delete:  &raft_cmdpb.DeleteResponse{},
 				})
-			case raft_cmdpb.CmdType_Snap:
-				//d.Region是一个指针，后面可能修改它的值，所以应该重新new一个Region复制过去
-				responseRegion := new(metapb.Region)
-				data, err := d.Region().Marshal()
-				if err != nil {
-					panic(err)
-				}
-				err = responseRegion.Unmarshal(data)
-				if err != nil {
-					panic(err)
-				}
-				//engine_util.DPrintf("SNAP,region-%v", responseRegion)
-				responses = append(responses, &raft_cmdpb.Response{
-					CmdType: raft_cmdpb.CmdType_Snap,
-					Snap:    &raft_cmdpb.SnapResponse{Region: responseRegion},
-				})
-				flag = true
 			}
 		}
 
@@ -236,11 +223,7 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBa
 			Header:    header,
 			Responses: responses,
 		}
-		if flag {
-			d.callbackPropose(entry, response, d.peerStorage.Engines.Kv.NewTransaction(false))
-		} else {
-			d.callbackPropose(entry, response, nil)
-		}
+		d.callbackPropose(entry, response, nil)
 	}
 }
 
@@ -272,6 +255,9 @@ func (d *peerMsgHandler) handleConfigChange(entry *eraftpb.Entry, kvWB *engine_u
 		//engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- ConfigChange-EpochNotMatch(stoneId,peerID)--epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, peerContext.StoreId, peerContext.Id, d.Region().RegionEpoch)
 		return 1
 	}
+
+	// 在configChange前尝试apply get请求，防止epoch改变导致重发影响性能
+	d.callbackReadOnlyPropose(d.peerStorage.applyState.AppliedIndex)
 
 	if cc.ChangeType == eraftpb.ConfChangeType_AddNode {
 		// 新增节点
@@ -404,8 +390,11 @@ func (d *peerMsgHandler) handleSplit(request *raft_cmdpb.AdminRequest, kvWB *eng
 		log.Warning(fmt.Sprintf("storeID,peerId,RegionId[%v,%v,%v]--split peers not match,myPeer-%v,newPeer-%v,Epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers, split.NewPeerIds, d.Region().RegionEpoch))
 		return
 		//panic(fmt.Sprintf("storeID,peerId,RegionId[%v,%v,%v]--split peers not match,myPeer-%v,newPeer-%v,Epoch-%v", d.Meta.StoreId, d.PeerId(), d.regionId, d.Region().Peers, split.NewPeerIds, d.Region().RegionEpoch))
-
 	}
+
+	// 在split前尝试apply get请求，防止epoch改变导致重发影响性能
+	d.callbackReadOnlyPropose(d.peerStorage.applyState.AppliedIndex)
+
 	// 新建region，注意要将region.peers排序后分配peerId，不然可能不同peer上新建时newPeerId对应分裂的peer不同
 	for i, _ := range d.Region().Peers {
 		for j := i + 1; j < len(d.Region().Peers); j++ {
@@ -433,7 +422,7 @@ func (d *peerMsgHandler) handleSplit(request *raft_cmdpb.AdminRequest, kvWB *eng
 	if err != nil {
 		panic(err)
 	}
-	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Split]Command -- splitKey-%v,startKey-%v,endKey-%v,epoch-%v,newRegionId-%v,oldPeers-%v,newPeers-%v", d.Meta.StoreId, d.PeerId(), d.regionId, split.SplitKey, d.Region().StartKey, d.Region().EndKey, d.Region().RegionEpoch, split.NewRegionId, d.Region().Peers, split.NewPeerIds)
+	engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[Split]Command -- splitKey-%v,startKey-%v,endKey-%v,epoch-%v,newRegionId-%v,oldPeers-%v,newPeers-%v", d.Meta.StoreId, d.PeerId(), d.regionId, string(split.SplitKey), string(d.Region().StartKey), string(d.Region().EndKey), d.Region().RegionEpoch, split.NewRegionId, d.Region().Peers, split.NewPeerIds)
 
 	d.Region().EndKey = split.SplitKey
 	d.Region().RegionEpoch.Version++
@@ -504,6 +493,84 @@ func (d *peerMsgHandler) checkEpochNotMatch(entry *eraftpb.Entry, msg *raft_cmdp
 		return true
 	}
 	return false
+}
+func (d *peerMsgHandler) callbackReadOnlyPropose(applyIndex uint64) {
+	for len(d.readOnlyProposal) != 0 {
+		entry := d.readOnlyProposal[0]
+		if applyIndex >= entry.ReadIndex {
+			d.readOnlyProposal = d.readOnlyProposal[1:]
+			msg := new(raft_cmdpb.RaftCmdRequest)
+			err := msg.Unmarshal(entry.Data)
+			if err != nil {
+				panic(err)
+			}
+
+			// 检查Epoch
+			err = util.CheckRegionEpoch(msg, d.Region(), true)
+			if errEpochNotMatching, ok := err.(*util.ErrEpochNotMatch); ok {
+				siblingRegion := d.findSiblingRegion()
+				if siblingRegion != nil {
+					errEpochNotMatching.Regions = append(errEpochNotMatching.Regions, siblingRegion)
+				}
+				entry.Cb.Done(ErrResp(errEpochNotMatching))
+				continue
+			}
+
+			// 因为可能存在split，当请求错误的region时应该返回错误
+			if err = d.checkKeyNotInRegion(msg.Requests); err != nil {
+				entry.Cb.Done(ErrResp(err))
+				continue
+			}
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Apply[ReadOnly]Command(Id,ReadIndex,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, entry.Id, entry.ReadIndex, msg.Requests)
+
+			//记录是否有snap,有的话需要new txn
+			flag := false
+
+			// apply所有外部请求
+			header := &raft_cmdpb.RaftResponseHeader{}
+			responses := make([]*raft_cmdpb.Response, 0)
+			for _, request := range msg.Requests {
+				switch request.CmdType {
+				case raft_cmdpb.CmdType_Get:
+					get := request.Get
+					val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, get.Cf, get.Key)
+					responses = append(responses, &raft_cmdpb.Response{
+						CmdType: raft_cmdpb.CmdType_Get,
+						Get:     &raft_cmdpb.GetResponse{Value: val},
+					})
+
+				case raft_cmdpb.CmdType_Snap:
+					//d.Region是一个指针，后面可能修改它的值，所以应该重新new一个Region复制过去
+					responseRegion := new(metapb.Region)
+					data, err := d.Region().Marshal()
+					if err != nil {
+						panic(err)
+					}
+					err = responseRegion.Unmarshal(data)
+					if err != nil {
+						panic(err)
+					}
+					//engine_util.DPrintf("SNAP,region-%v", responseRegion)
+					responses = append(responses, &raft_cmdpb.Response{
+						CmdType: raft_cmdpb.CmdType_Snap,
+						Snap:    &raft_cmdpb.SnapResponse{Region: responseRegion},
+					})
+					flag = true
+				}
+			}
+			// 返回结果
+			response := &raft_cmdpb.RaftCmdResponse{
+				Header:    header,
+				Responses: responses,
+			}
+			if flag {
+				entry.Cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+			}
+			entry.Cb.Done(response)
+		} else {
+			break
+		}
+	}
 }
 func (d *peerMsgHandler) callbackPropose(entry *eraftpb.Entry, response *raft_cmdpb.RaftCmdResponse, txn *badger.Txn) {
 	// call back
@@ -631,13 +698,30 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			cb.Done(ErrResp(err))
 			return
 		}
+
+		// 只读消息
+		if len(msg.Requests) != 0 && (msg.Requests[0].CmdType == raft_cmdpb.CmdType_Get || msg.Requests[0].CmdType == raft_cmdpb.CmdType_Snap) {
+			var data []byte
+			data, err = msg.Marshal()
+			if err != nil {
+				panic(err)
+			}
+			err = d.RaftGroup.ProposeReadOnly(data, cb)
+			if err != nil {
+				cb.Done(ErrResp(err))
+				return
+			}
+			engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Propose[ReadOnly]Command(index,term,request) -- requests-[%v]", d.Meta.StoreId, d.PeerId(), d.regionId, msg.Requests)
+			return
+		}
+
 		// 使用Proposal来保留[index, term, callback]，callback通过channel便于在后面提交的时候进行process
 		d.proposals = append(d.proposals, &proposal{
 			index: d.nextProposalIndex(),
 			term:  d.Term(),
 			cb:    cb,
 		})
-		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Propose[Normal]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, d.nextProposalIndex(), d.Term(), msg.Requests)
+		engine_util.DPrintf("storeID,peerId,RegionId[%v,%v,%v] -- Propose[Write]Command(index,term,request) -- entry-[%v,%v,%v]", d.Meta.StoreId, d.PeerId(), d.regionId, d.nextProposalIndex(), d.Term(), msg.Requests)
 	} else {
 		// 处理AdminRequest，包括四种：CompactLog、TransferLeader、ChangePeer、Split
 		request := msg.AdminRequest

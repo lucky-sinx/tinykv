@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -62,6 +63,8 @@ type Ready struct {
 	// store.
 	CommittedEntries []pb.Entry
 
+	// 需要提交的只读命令
+	ReadOnlyEntries []*ReadOnlyEntry
 	// Messages specifies outbound messages to be sent AFTER Entries are
 	// committed to stable storage.
 	// If it contains a MessageType_MsgSnapshot message, the application MUST report back to raft
@@ -100,6 +103,11 @@ func (rn *RawNode) Campaign() error {
 	return rn.Raft.Step(pb.Message{
 		MsgType: pb.MessageType_MsgHup,
 	})
+}
+
+// ProposeReadOnly 只读消息
+func (rn *RawNode) ProposeReadOnly(data []byte, cb *message.Callback) error {
+	return rn.Raft.proposeReadOnly(data, cb)
 }
 
 // Propose proposes data be appended to the raft log.
@@ -161,8 +169,8 @@ func (rn *RawNode) Ready() Ready {
 		Entries:          r.RaftLog.unstableEntries(),
 		CommittedEntries: r.RaftLog.nextEnts(),
 		Messages:         r.msgs,
+		ReadOnlyEntries:  r.commitReadOnlyQueue,
 	}
-
 	if len(rd.Messages) == 0 {
 		rd.Messages = nil
 	}
@@ -198,6 +206,9 @@ func (rn *RawNode) HasReady() bool {
 	if len(r.msgs) > 0 || len(r.RaftLog.unstableEntries()) > 0 || r.RaftLog.hasNextEnts() {
 		return true
 	}
+	if len(r.commitReadOnlyQueue) != 0 {
+		return true
+	}
 	return false
 }
 
@@ -216,6 +227,7 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.prevHardSt = rd.HardState
 	}
 
+	r.commitReadOnlyQueue = make([]*ReadOnlyEntry, 0)
 	// 更新applyIndex
 	if rd.CommittedEntries != nil && len(rd.CommittedEntries) != 0 {
 		newApplyIndex := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index

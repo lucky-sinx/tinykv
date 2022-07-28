@@ -17,6 +17,10 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
+
 	//"github.com/pingcap-incubator/tinykv/kv/raftstore"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -112,6 +116,14 @@ type Progress struct {
 	LastCommunicateTS int64
 }
 
+// ReadOnlyEntry 只读消息记录在本地
+type ReadOnlyEntry struct {
+	// 只读消息提交时的commitIndex，表示谁apply后返回
+	ReadIndex uint64
+	Cb        *message.Callback
+	Data      []byte
+	Id        uint64
+}
 type Raft struct {
 	id uint64
 
@@ -174,6 +186,15 @@ type Raft struct {
 	leaderLeaseTimeout int64
 	// 当前tick数
 	tickCnt int64
+
+	// 只读消息数量
+	readOnlyCnt uint64
+	// 只读消息等待接收队列
+	pendingReadOnlyQueue []*ReadOnlyEntry
+	// 只读消息等待apply队列
+	commitReadOnlyQueue []*ReadOnlyEntry
+	// 记录对应只读消息受到了多少心跳
+	readOnlyHeartBeatCnt map[uint64]int
 }
 
 // 读取持久化数据
@@ -344,13 +365,15 @@ func (r *Raft) sendAppend(to uint64) bool {
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
-func (r *Raft) sendHeartbeat(to uint64) {
+func (r *Raft) sendHeartbeat(to uint64, id uint64) {
 	// Your Code Here (2A).
 	m := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
+		// 需要确认哪条ReadOnly发过来时是真的Leader
+		Index: id,
 		// 通过心跳同步commit时只能匹配到match对应位置
 		Commit: min(r.Prs[to].Match, r.RaftLog.committed),
 	}
@@ -378,11 +401,11 @@ func (r *Raft) broadcastAppend() {
 	}
 }
 
-// 广播append消息
-func (r *Raft) broadcastHeartBeat() {
+// 广播HeartBeat消息,如果是因为propose了ReadOnly命令，带上id
+func (r *Raft) broadcastHeartBeat(id uint64) {
 	for to := range r.Prs {
 		if to != r.id {
-			r.sendHeartbeat(to)
+			r.sendHeartbeat(to, id)
 		}
 	}
 }
@@ -413,7 +436,7 @@ func (r *Raft) broadcastVote() {
 	// 单节点直接选举成功
 	if len(r.Prs) == 1 {
 		r.becomeLeader()
-		r.broadcastHeartBeat()
+		r.broadcastHeartBeat(0)
 	}
 }
 
@@ -449,6 +472,10 @@ func (r *Raft) tick() {
 		//	}
 		//}
 	} else {
+		// 新增节点未初始化，不能让它Term增大了，否则万一prs为空可能成为Leader
+		if len(r.Prs) == 0 {
+			return
+		}
 		r.electionElapsed++
 		// Follow,Candidate超时选举
 		if r.electionElapsed >= r.randomElectionTimeout {
@@ -483,6 +510,28 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	r.Lead = lead
 
+	// 变回Follow清空ReadOnly相关信息，并将未提交的只读消息转发给Leader
+	if r.pendingReadOnlyQueue != nil {
+		for _, entry := range r.pendingReadOnlyQueue {
+			// 改为直接返回错误让其重发,因新定义消息类型需要带上callback
+			//if r.Lead != None {
+			//	m := &pb.Message{
+			//		MsgType: pb.MessageType_MsgPropose,
+			//		From:    r.id,
+			//		To:      r.Lead,
+			//		Entries: []*pb.Entry{{Data: entry.Data}}}
+			//	r.send(*m)
+			//}
+			resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
+			resp.Header.Error = util.RaftstoreErrToPbError(ErrProposalDropped)
+			entry.Cb.Done(resp)
+		}
+	}
+	r.pendingReadOnlyQueue = nil
+	// commit不清空，可以直接提交
+	//r.commitReadOnlyQueue = nil
+	r.readOnlyHeartBeatCnt = nil
+
 	DPrintf("[%v]--init--:Follower--[Term-%v,Lead-%v]", r.id, r.Term, r.Lead)
 }
 
@@ -515,6 +564,12 @@ func (r *Raft) becomeLeader() {
 		r.Prs[peer].LastCommunicateTS = r.tickCnt
 	}
 	DPrintf("[%v]--init--:Leader--[Term-%v,Lead-%v]\n\n", r.id, r.Term, r.Lead)
+
+	// 变成Leader初始化ReadOnly相关信息
+	r.readOnlyCnt = 0
+	r.pendingReadOnlyQueue = make([]*ReadOnlyEntry, 0)
+	r.commitReadOnlyQueue = make([]*ReadOnlyEntry, 0)
+	r.readOnlyHeartBeatCnt = make(map[uint64]int, 0)
 
 	// append一条空消息
 	//使用新配置进行成员变更日志同步：
@@ -581,6 +636,63 @@ func (r *Raft) appendEntry(entries ...*pb.Entry) {
 	}
 }
 
+// ProposeReadOnly 只读消息
+func (r *Raft) proposeReadOnly(data []byte, cb *message.Callback) error {
+	//m := &pb.Message{
+	//	MsgType: pb.MessageType_MsgPropose,
+	//	From:    r.id,
+	//	Entries: []*pb.Entry{{Data: data}}}
+
+	if r.State == StateFollower {
+		//if r.Lead == None {
+		DPrintf("[%v]--no leader at term-%v,Follow drop Propose", r.id, r.Term)
+		return ErrProposalDropped
+		//}
+		//m.To = r.Lead
+		//r.send(*m)
+	} else if r.State == StateCandidate {
+		DPrintf("[%v]--no leader at term-%v,Candidate drop Propose", r.id, r.Term)
+		return ErrProposalDropped
+	} else {
+		if r.leadTransferee != None {
+			DPrintf("[%v]--rejectPropose--:doing Transfer-term-%v,to-%v", r.id, r.Term, r.leadTransferee)
+			return ErrProposalDropped
+		}
+		// 如果该leader在成为新的leader之后没有提交过任何值，那么会直接返回不做处理。
+		commitTerm, _ := r.RaftLog.Term(r.RaftLog.committed)
+		if commitTerm != 0 && commitTerm < r.Term {
+			return ErrProposalDropped
+		}
+
+		r.readOnlyCnt++
+		newReadOnlyEntry := &ReadOnlyEntry{
+			ReadIndex: r.RaftLog.committed,
+			Cb:        cb,
+			Data:      data,
+			Id:        r.readOnlyCnt,
+		}
+
+		if len(r.Prs) != 1 {
+			r.pendingReadOnlyQueue = append(r.pendingReadOnlyQueue, newReadOnlyEntry)
+			DPrintf("[%v]--Receive[ReadOnly]Command--entry(Id,ReadIndex)-[%v,%v]--pendingReadOnlyQueue-%v", r.id, newReadOnlyEntry.Id, newReadOnlyEntry.ReadIndex, r.pendingReadOnlyQueue)
+
+			r.readOnlyHeartBeatCnt[r.readOnlyCnt] = 1
+			r.broadcastHeartBeat(r.readOnlyCnt)
+		} else {
+			// 单节点时应该直接等待apply，并清空之前所有pending
+			for i, _ := range r.pendingReadOnlyQueue {
+				r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, r.pendingReadOnlyQueue[i])
+				delete(r.readOnlyHeartBeatCnt, r.pendingReadOnlyQueue[i].Id)
+			}
+			r.pendingReadOnlyQueue = make([]*ReadOnlyEntry, 0)
+			r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, newReadOnlyEntry)
+			DPrintf("[%v]--Receive[ReadOnly-AndCommit]Command--entry(Id,ReadIndex)-[%v,%v]--pendingReadOnlyQueue-%v", r.id, newReadOnlyEntry.Id, newReadOnlyEntry.ReadIndex, r.pendingReadOnlyQueue)
+		}
+
+	}
+	return nil
+}
+
 // 处理Leader消息
 func (r *Raft) stepLeader(m *pb.Message) error {
 	switch m.MsgType {
@@ -623,13 +735,35 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 
 	// 发送心跳
 	case pb.MessageType_MsgBeat:
-		r.broadcastHeartBeat()
+		r.broadcastHeartBeat(0)
 
 	// 处理心跳response
 	case pb.MessageType_MsgHeartbeatResponse:
 		if r.Term >= m.Term {
 			// 记录上次通信时间
 			r.Prs[m.From].LastCommunicateTS = r.tickCnt
+
+			if _, ok := r.readOnlyHeartBeatCnt[m.Index]; m.Index != 0 && ok {
+				r.readOnlyHeartBeatCnt[m.Index]++
+				DPrintf("[%v]--Receive[HeartBeat-Index-%v]--readOnlyHeartBeatCnt-%v--commitQueue-%v,pendingQueue-%v", r.id, m.Index, r.readOnlyHeartBeatCnt[m.Index], r.commitReadOnlyQueue, r.pendingReadOnlyQueue)
+
+				// 超半数节点确认心跳，该ReadOnlyId及之前所有ReadOnlyId均可apply
+				if r.readOnlyHeartBeatCnt[m.Index] >= len(r.Prs)/2+1 && r.pendingReadOnlyQueue != nil {
+
+					// 每次删开头保险些，之前写法是记录删到哪了，然后用[truncIndex:]截断，单独试了下若超出范围会出问题
+					for len(r.pendingReadOnlyQueue) != 0 {
+						if r.pendingReadOnlyQueue[0].Id <= m.Index {
+							r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, r.pendingReadOnlyQueue[0])
+							delete(r.readOnlyHeartBeatCnt, r.pendingReadOnlyQueue[0].Id)
+							r.pendingReadOnlyQueue = r.pendingReadOnlyQueue[1:]
+						} else {
+							break
+						}
+					}
+
+					DPrintf("[%v]--Receive[HeartBeat-Index-%v]--commitQueue-%v,pendingQueue-%v", r.id, m.Index, r.commitReadOnlyQueue, r.pendingReadOnlyQueue)
+				}
+			}
 
 			pr := r.Prs[m.From]
 			if r.leadTransferee == None && r.RaftLog.LastIndex() > pr.Match {
@@ -908,6 +1042,8 @@ func (r *Raft) handleHeartbeat(m *pb.Message) {
 		To:      m.From,
 		From:    r.id,
 		Term:    r.Term,
+		// 确认该ReadOnly命令在Leader上
+		Index: m.Index,
 	}
 	if m.Term >= r.Term {
 		if m.Commit > r.RaftLog.committed {
@@ -1020,7 +1156,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		//if i-1 != m.Entries[j-1].Index {
 		//	panic(fmt.Sprintf("check the function,i-%v,m.Entries[j].Index-%v", i, m.Entries[j].Index))
 		//}
-		DPrintf("[%v]--AE_Request--Success--:To [%v],myTerm-%v,LeaderTerm-%v,afterIndex-%v,LastIndex-%v,myEntry-%v,appendEntry-%v,j-%v", m.From, r.id, r.Term, m.Term, i-1, r.RaftLog.LastIndex(), r.RaftLog.entries, m.Entries, j)
+		//DPrintf("[%v]--AE_Request--Success--:To [%v],myTerm-%v,LeaderTerm-%v,afterIndex-%v,LastIndex-%v,myEntry-%v,appendEntry-%v,j-%v", m.From, r.id, r.Term, m.Term, i-1, r.RaftLog.LastIndex(), r.RaftLog.entries, m.Entries, j)
 		r.RaftLog.truncateAndAppend(getEntries(m.Entries[j:]))
 		DPrintf("[%v]--AE_Request--Success--:To [%v],myTerm-%v,LeaderTerm-%v,afterIndex-%v,LastIndex-%v", m.From, r.id, r.Term, m.Term, i-1, r.RaftLog.LastIndex())
 	}
@@ -1116,6 +1252,15 @@ func (r *Raft) removeNode(id uint64) {
 	delete(r.Prs, id)
 	DPrintf("[%v]--RemoveNode-%v Success--term-%v", r.id, id, r.Term)
 
+	// remove后如果只剩一个节点需要等待apply所有readonly消息
+	if len(r.Prs) == 1 {
+		// 单节点时应该直接等待apply，并清空之前所有pending
+		for i, _ := range r.pendingReadOnlyQueue {
+			r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, r.pendingReadOnlyQueue[i])
+			delete(r.readOnlyHeartBeatCnt, r.pendingReadOnlyQueue[i].Id)
+		}
+		r.pendingReadOnlyQueue = make([]*ReadOnlyEntry, 0)
+	}
 	// 更新CommitIndex
 	if r.State == StateLeader {
 		r.updateCommitIndexL()
