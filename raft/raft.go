@@ -114,6 +114,8 @@ type Progress struct {
 	Match, Next uint64
 	// 上次与Follow通信时间
 	LastCommunicateTS int64
+	// 上次收到的心跳回复commitIndex
+	ReadOnlyHeartBeatIndex uint64
 }
 
 // ReadOnlyEntry 只读消息记录在本地
@@ -194,7 +196,8 @@ type Raft struct {
 	// 只读消息等待apply队列
 	commitReadOnlyQueue []*ReadOnlyEntry
 	// 记录对应只读消息受到了多少心跳
-	readOnlyHeartBeatCnt map[uint64]int
+	// 改为：记录每个prs收到最近的心跳commitIndex回复,
+	readOnlyCommitIndex uint64
 }
 
 // 读取持久化数据
@@ -436,7 +439,7 @@ func (r *Raft) broadcastVote() {
 	// 单节点直接选举成功
 	if len(r.Prs) == 1 {
 		r.becomeLeader()
-		r.broadcastHeartBeat(0)
+		r.broadcastHeartBeat(r.readOnlyCnt)
 	}
 }
 
@@ -530,7 +533,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.pendingReadOnlyQueue = nil
 	// commit不清空，可以直接提交
 	//r.commitReadOnlyQueue = nil
-	r.readOnlyHeartBeatCnt = nil
+	//r.readOnlyHeartBeatCnt = nil
 
 	DPrintf("[%v]--init--:Follower--[Term-%v,Lead-%v]", r.id, r.Term, r.Lead)
 }
@@ -558,10 +561,12 @@ func (r *Raft) becomeLeader() {
 	lastIndex := r.RaftLog.LastIndex()
 	r.tickCnt = 0
 	r.leaderAliveElapsed = 0
+	r.readOnlyCommitIndex = 0
 	for peer := range r.Prs {
 		r.Prs[peer].Next = lastIndex + 1
 		r.Prs[peer].Match = 0
 		r.Prs[peer].LastCommunicateTS = r.tickCnt
+		r.Prs[peer].ReadOnlyHeartBeatIndex = 0
 	}
 	DPrintf("[%v]--init--:Leader--[Term-%v,Lead-%v]\n\n", r.id, r.Term, r.Lead)
 
@@ -569,7 +574,6 @@ func (r *Raft) becomeLeader() {
 	r.readOnlyCnt = 0
 	r.pendingReadOnlyQueue = make([]*ReadOnlyEntry, 0)
 	r.commitReadOnlyQueue = make([]*ReadOnlyEntry, 0)
-	r.readOnlyHeartBeatCnt = make(map[uint64]int, 0)
 
 	// append一条空消息
 	//使用新配置进行成员变更日志同步：
@@ -676,14 +680,11 @@ func (r *Raft) proposeReadOnly(data []byte, cb *message.Callback) error {
 			r.pendingReadOnlyQueue = append(r.pendingReadOnlyQueue, newReadOnlyEntry)
 			DPrintf("[%v]--Receive[ReadOnly]Command--entry(Id,ReadIndex)-[%v,%v]--pendingReadOnlyQueue-%v", r.id, newReadOnlyEntry.Id, newReadOnlyEntry.ReadIndex, r.pendingReadOnlyQueue)
 
-			r.readOnlyHeartBeatCnt[r.readOnlyCnt] = 1
 			r.broadcastHeartBeat(r.readOnlyCnt)
 		} else {
 			// 单节点时应该直接等待apply，并清空之前所有pending
-			for i, _ := range r.pendingReadOnlyQueue {
-				r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, r.pendingReadOnlyQueue[i])
-				delete(r.readOnlyHeartBeatCnt, r.pendingReadOnlyQueue[i].Id)
-			}
+			r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, r.pendingReadOnlyQueue...)
+
 			r.pendingReadOnlyQueue = make([]*ReadOnlyEntry, 0)
 			r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, newReadOnlyEntry)
 			DPrintf("[%v]--Receive[ReadOnly-AndCommit]Command--entry(Id,ReadIndex)-[%v,%v]--pendingReadOnlyQueue-%v", r.id, newReadOnlyEntry.Id, newReadOnlyEntry.ReadIndex, r.pendingReadOnlyQueue)
@@ -735,7 +736,7 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 
 	// 发送心跳
 	case pb.MessageType_MsgBeat:
-		r.broadcastHeartBeat(0)
+		r.broadcastHeartBeat(r.readOnlyCnt)
 
 	// 处理心跳response
 	case pb.MessageType_MsgHeartbeatResponse:
@@ -743,26 +744,10 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 			// 记录上次通信时间
 			r.Prs[m.From].LastCommunicateTS = r.tickCnt
 
-			if _, ok := r.readOnlyHeartBeatCnt[m.Index]; m.Index != 0 && ok {
-				r.readOnlyHeartBeatCnt[m.Index]++
-				DPrintf("[%v]--Receive[HeartBeat-Index-%v]--readOnlyHeartBeatCnt-%v--commitQueue-%v,pendingQueue-%v", r.id, m.Index, r.readOnlyHeartBeatCnt[m.Index], r.commitReadOnlyQueue, r.pendingReadOnlyQueue)
-
-				// 超半数节点确认心跳，该ReadOnlyId及之前所有ReadOnlyId均可apply
-				if r.readOnlyHeartBeatCnt[m.Index] >= len(r.Prs)/2+1 && r.pendingReadOnlyQueue != nil {
-
-					// 每次删开头保险些，之前写法是记录删到哪了，然后用[truncIndex:]截断，单独试了下若超出范围会出问题
-					for len(r.pendingReadOnlyQueue) != 0 {
-						if r.pendingReadOnlyQueue[0].Id <= m.Index {
-							r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, r.pendingReadOnlyQueue[0])
-							delete(r.readOnlyHeartBeatCnt, r.pendingReadOnlyQueue[0].Id)
-							r.pendingReadOnlyQueue = r.pendingReadOnlyQueue[1:]
-						} else {
-							break
-						}
-					}
-
-					DPrintf("[%v]--Receive[HeartBeat-Index-%v]--commitQueue-%v,pendingQueue-%v", r.id, m.Index, r.commitReadOnlyQueue, r.pendingReadOnlyQueue)
-				}
+			if m.Index > r.Prs[m.From].ReadOnlyHeartBeatIndex {
+				r.Prs[m.From].ReadOnlyHeartBeatIndex = m.Index
+				r.updateReadOnlyCommitIndex()
+				DPrintf("[%v]--Receive[HeartBeat-Index-%v]--%v from [%v]--commitQueue-%v,pendingQueue-%v", r.id, m.Index, m.From, r.commitReadOnlyQueue, r.pendingReadOnlyQueue)
 			}
 
 			pr := r.Prs[m.From]
@@ -1005,6 +990,39 @@ func (r *Raft) updateCommitIndexL() {
 		} else {
 			//DPrintf("[%v]--AE_True--UpdateCommit--TermLittle--:commitIndex-%v,nxtCommitMax-%v,nxtCommitTerm-%v,cureentTerm-%v", r.id, r.RaftLog.committed, nxtCommitMax, r.RaftLog.getTerm(nxtCommitMax), r.Term)
 		}
+	}
+}
+
+// 当心跳回复更新时，尝试更新ReadOnlyHeartBeatIndex
+func (r *Raft) updateReadOnlyCommitIndex() {
+	//Leader更新commitIndex
+	var tmp = make([]int, len(r.Prs))
+	r.Prs[r.id].ReadOnlyHeartBeatIndex = r.readOnlyCnt
+	// Prs的Key不一定连续
+	cnt := 0
+	for _, progress := range r.Prs {
+		tmp[cnt] = int(progress.ReadOnlyHeartBeatIndex)
+		cnt++
+	}
+
+	sort.Ints(tmp)
+	nxtReadOnlyIndex := uint64(tmp[(len(r.Prs)-1)/2])
+
+	if nxtReadOnlyIndex > r.readOnlyCommitIndex {
+		//更新readOnlyCommitIndex
+		r.readOnlyCommitIndex = nxtReadOnlyIndex
+
+		// readOnlyCommitIndex更新，尝试apply
+		// 每次删开头保险些，之前写法是记录删到哪了，然后用[truncIndex:]截断，单独试了下若超出范围会出问题
+		for len(r.pendingReadOnlyQueue) != 0 {
+			if r.pendingReadOnlyQueue[0].Id <= nxtReadOnlyIndex {
+				r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, r.pendingReadOnlyQueue[0])
+				r.pendingReadOnlyQueue = r.pendingReadOnlyQueue[1:]
+			} else {
+				break
+			}
+		}
+		DPrintf("[%v]--Receive[HeartBeat-nxtReadOnlyIndex-%v]--commitQueue-%v,pendingQueue-%v", r.id, nxtReadOnlyIndex, r.commitReadOnlyQueue, r.pendingReadOnlyQueue)
 	}
 }
 
@@ -1252,18 +1270,10 @@ func (r *Raft) removeNode(id uint64) {
 	delete(r.Prs, id)
 	DPrintf("[%v]--RemoveNode-%v Success--term-%v", r.id, id, r.Term)
 
-	// remove后如果只剩一个节点需要等待apply所有readonly消息
-	if len(r.Prs) == 1 {
-		// 单节点时应该直接等待apply，并清空之前所有pending
-		for i, _ := range r.pendingReadOnlyQueue {
-			r.commitReadOnlyQueue = append(r.commitReadOnlyQueue, r.pendingReadOnlyQueue[i])
-			delete(r.readOnlyHeartBeatCnt, r.pendingReadOnlyQueue[i].Id)
-		}
-		r.pendingReadOnlyQueue = make([]*ReadOnlyEntry, 0)
-	}
-	// 更新CommitIndex
+	// 更新CommitIndex以及ReadOnlyCommitIndex
 	if r.State == StateLeader {
 		r.updateCommitIndexL()
+		r.updateReadOnlyCommitIndex()
 	}
 
 }

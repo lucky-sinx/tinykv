@@ -247,6 +247,16 @@ func (p *peer) Destroy(engine *engine_util.Engines, keepData bool) error {
 	for _, proposal := range p.proposals {
 		NotifyReqRegionRemoved(region.Id, proposal.cb)
 	}
+	// 删除自身时全部需要通知
+	for _, entry := range p.readOnlyProposal {
+		NotifyReqRegionRemoved(region.Id, entry.Cb)
+	}
+	for _, entry := range p.RaftGroup.GetPendingReadOnlyQueue() {
+		NotifyReqRegionRemoved(region.Id, entry.Cb)
+	}
+	for _, entry := range p.RaftGroup.GetCommitReadOnlyQueue() {
+		NotifyReqRegionRemoved(region.Id, entry.Cb)
+	}
 	p.proposals = nil
 	p.readOnlyProposal = nil
 

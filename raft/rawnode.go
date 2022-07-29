@@ -110,6 +110,13 @@ func (rn *RawNode) ProposeReadOnly(data []byte, cb *message.Callback) error {
 	return rn.Raft.proposeReadOnly(data, cb)
 }
 
+func (rn *RawNode) GetPendingReadOnlyQueue() []*ReadOnlyEntry {
+	return rn.Raft.pendingReadOnlyQueue
+}
+func (rn *RawNode) GetCommitReadOnlyQueue() []*ReadOnlyEntry {
+	return rn.Raft.commitReadOnlyQueue
+}
+
 // Propose proposes data be appended to the raft log.
 func (rn *RawNode) Propose(data []byte) error {
 	ent := pb.Entry{Data: data}
