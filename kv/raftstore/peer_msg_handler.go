@@ -257,6 +257,15 @@ func (d *peerMsgHandler) handleConfigChange(entry *eraftpb.Entry, kvWB *engine_u
 	}
 
 	// 在configChange前尝试apply get请求，防止epoch改变导致重发影响性能
+	err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+	if err != nil {
+		panic(err)
+	}
+	err = d.peerStorage.Engines.WriteKV(kvWB)
+	if err != nil {
+		panic(err)
+	}
+	kvWB.Reset()
 	d.callbackReadOnlyPropose(d.peerStorage.applyState.AppliedIndex)
 
 	if cc.ChangeType == eraftpb.ConfChangeType_AddNode {
@@ -393,6 +402,15 @@ func (d *peerMsgHandler) handleSplit(request *raft_cmdpb.AdminRequest, kvWB *eng
 	}
 
 	// 在split前尝试apply get请求，防止epoch改变导致重发影响性能
+	err = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+	if err != nil {
+		panic(err)
+	}
+	err = d.peerStorage.Engines.WriteKV(kvWB)
+	if err != nil {
+		panic(err)
+	}
+	kvWB.Reset()
 	d.callbackReadOnlyPropose(d.peerStorage.applyState.AppliedIndex)
 
 	// 新建region，注意要将region.peers排序后分配peerId，不然可能不同peer上新建时newPeerId对应分裂的peer不同

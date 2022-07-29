@@ -176,8 +176,11 @@ func (rn *RawNode) Ready() Ready {
 		Entries:          r.RaftLog.unstableEntries(),
 		CommittedEntries: r.RaftLog.nextEnts(),
 		Messages:         r.msgs,
-		ReadOnlyEntries:  r.commitReadOnlyQueue,
 	}
+	if len(r.commitReadOnlyQueue) != 0 {
+		rd.ReadOnlyEntries = r.commitReadOnlyQueue
+	}
+
 	if len(rd.Messages) == 0 {
 		rd.Messages = nil
 	}

@@ -247,16 +247,17 @@ func newRaft(c *Config) *Raft {
 
 		msgs: make([]pb.Message, 0),
 
-		heartbeatTimeout:   c.HeartbeatTick,
-		electionTimeout:    c.ElectionTick,
-		leaderAliveTimeout: int64(c.ElectionTick) * 2,
-		leaderLeaseTimeout: int64(c.ElectionTick) * 9 / 10,
-		heartbeatElapsed:   0,
-		electionElapsed:    0,
-		tickCnt:            0,
-		leaderAliveElapsed: 0,
-		leadTransferee:     0,
-		PendingConfIndex:   0,
+		heartbeatTimeout:    c.HeartbeatTick,
+		electionTimeout:     c.ElectionTick,
+		leaderAliveTimeout:  int64(c.ElectionTick) * 2,
+		leaderLeaseTimeout:  int64(c.ElectionTick) * 9 / 10,
+		heartbeatElapsed:    0,
+		electionElapsed:     0,
+		tickCnt:             0,
+		leaderAliveElapsed:  0,
+		leadTransferee:      0,
+		PendingConfIndex:    0,
+		commitReadOnlyQueue: make([]*ReadOnlyEntry, 0),
 	}
 
 	// 上层传节点数据时实际上是在peerStorage中，但2A的测试中是在config中传过来的
@@ -525,8 +526,9 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 			//		Entries: []*pb.Entry{{Data: entry.Data}}}
 			//	r.send(*m)
 			//}
+
 			resp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
-			resp.Header.Error = util.RaftstoreErrToPbError(ErrProposalDropped)
+			resp.Header.Error = util.RaftstoreErrToPbError(&util.ErrNotLeader{})
 			entry.Cb.Done(resp)
 		}
 	}
@@ -573,7 +575,7 @@ func (r *Raft) becomeLeader() {
 	// 变成Leader初始化ReadOnly相关信息
 	r.readOnlyCnt = 0
 	r.pendingReadOnlyQueue = make([]*ReadOnlyEntry, 0)
-	r.commitReadOnlyQueue = make([]*ReadOnlyEntry, 0)
+	//r.commitReadOnlyQueue = make([]*ReadOnlyEntry, 0)
 
 	// append一条空消息
 	//使用新配置进行成员变更日志同步：
