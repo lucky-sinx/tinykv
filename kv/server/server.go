@@ -152,7 +152,7 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 		}
 		if lock.Ts != startVersion {
 			// 不是自己的lock，说明还是被rollback了
-			return &kvrpcpb.CommitResponse{Error: &kvrpcpb.KeyError{}}, nil
+			return &kvrpcpb.CommitResponse{Error: &kvrpcpb.KeyError{Retryable: "true"}}, nil
 		}
 		// 正常commit
 		write := &mvcc.Write{
