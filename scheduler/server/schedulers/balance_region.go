@@ -16,7 +16,6 @@ package schedulers
 import (
 	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
-	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/filter"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/opt"
 	"sort"
@@ -80,12 +79,27 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
 	// Your Code Here (3C).
 
-	// 1.首先，Scheduler 将选择所有合适的 store。然后根据它们的 region 大小进行排序。
+	//1.首先，Scheduler 将选择所有合适的 store。然后根据它们的 region 大小进行排序。
 	stores := cluster.GetStores()
-	suitableStores := filter.SelectSourceStores(stores, []filter.Filter{filter.StoreStateFilter{ActionScope: s.GetName(), TransferLeader: true}}, cluster)
+	//suitableStores := filter.SelectSourceStores(stores, []filter.Filter{filter.StoreStateFilter{ActionScope: s.GetName(), TransferLeader: true}}, cluster)
+	suitableStores := make([]*core.StoreInfo, 0)
+	for i, _ := range stores {
+		// store 必须状态是 up 且最近心跳的间隔小于集群判断宕机的时间阈值
+		if stores[i].IsUp() && stores[i].DownTime() <= cluster.GetMaxStoreDownTime() {
+			suitableStores = append(suitableStores, stores[i])
+		}
+	}
 	sort.Slice(suitableStores, func(i, j int) bool {
 		return suitableStores[i].GetRegionSize() > suitableStores[j].GetRegionSize()
 	})
+	//stores := cluster.GetStores()
+	//suitableStores := make([]*core.StoreInfo, 0)
+	//for i, _ := range stores {
+	//	// store 必须状态是 up 且最近心跳的间隔小于集群判断宕机的时间阈值
+	//	if stores[i].IsUp() && stores[i].DownTime() <= cluster.GetMaxStoreDownTime() {
+	//		suitableStores = append(suitableStores, stores[i])
+	//	}
+	//}
 	// 2.遍历suitableStores寻找合适的可转移的region
 	var region *core.RegionInfo
 	var sourceStoreIndex, targetStoreIndex = -1, -1
