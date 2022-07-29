@@ -747,7 +747,7 @@ func (r *Raft) stepLeader(m *pb.Message) error {
 			if m.Index > r.Prs[m.From].ReadOnlyHeartBeatIndex {
 				r.Prs[m.From].ReadOnlyHeartBeatIndex = m.Index
 				r.updateReadOnlyCommitIndex()
-				DPrintf("[%v]--Receive[HeartBeat-Index-%v]--%v from [%v]--commitQueue-%v,pendingQueue-%v", r.id, m.Index, m.From, r.commitReadOnlyQueue, r.pendingReadOnlyQueue)
+				DPrintf("[%v]--Receive[HeartBeat-Index-%v]--from [%v]--commitQueue-%v,pendingQueue-%v", r.id, m.Index, m.From, r.commitReadOnlyQueue, r.pendingReadOnlyQueue)
 			}
 
 			pr := r.Prs[m.From]
